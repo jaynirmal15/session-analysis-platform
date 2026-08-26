@@ -1,0 +1,37 @@
+apiVersion: 1
+
+# Both datasources are provisioned because the platform answers two different
+# kinds of question from two different stores: aggregate rates and trends from
+# Prometheus, and per-session drill-down from PostgreSQL. See ADR-0008 —
+# including the coupling this creates between dashboards and the schema.
+datasources:
+  - name: Prometheus
+    uid: sap-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST
+
+  - name: PostgreSQL
+    uid: sap-postgres
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: ${POSTGRES_USER}
+    editable: true
+    jsonData:
+      database: ${POSTGRES_DB}
+      sslmode: disable
+      postgresVersion: 1600
+      # Explicitly not TimescaleDB. See ADR-0004 — the ceiling of plain
+      # PostgreSQL is the thing being measured, so the escape hatch stays off.
+      timescaledb: false
+      maxOpenConns: 10
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    secureJsonData:
+      password: ${POSTGRES_PASSWORD}
