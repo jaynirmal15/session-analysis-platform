@@ -11,8 +11,9 @@
 // the query API wants a larger pool tolerant of long analytical scans against
 // old partitions.
 //
-// TODO(scope): pool construction lands here once the schema exists. Deferred
-// deliberately — there is nothing to connect to until migrations are designed
-// (ADR-0014), and a driver dependency added before it is used is a dependency
-// chosen without evidence.
+// TODO(scope): pool construction lands here once there is a query to run. The
+// schema now exists (ADR-0024), but correlation and the query API do not, so
+// there is still nothing to execute — and a driver dependency added before it
+// is used is a dependency chosen without evidence. Migrations are applied by
+// golang-migrate as a container (ADR-0023), which needs no Go driver.
 package database

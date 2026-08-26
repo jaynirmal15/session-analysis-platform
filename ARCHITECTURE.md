@@ -36,8 +36,17 @@ Two conventions worth stating up front:
 | [ADR-0011](#adr-0011--push-based-webhook-ingest-not-polling) | Push-based webhook ingest, not polling | Accepted |
 | [ADR-0012](#adr-0012--kubernetes-as-the-deployment-target-deferred) | Kubernetes as the deployment target, deferred | Deferred |
 | [ADR-0013](#adr-0013--mit-license) | MIT license | Accepted |
-| [ADR-0014](#adr-0014--event-schema-and-migrations-deliberately-deferred) | Event schema and migrations deliberately deferred | Open |
+| [ADR-0014](#adr-0014--event-schema-and-migrations-deliberately-deferred) | Event schema and migrations deliberately deferred | Superseded by ADR-0024 |
 | [ADR-0015](#adr-0015--internalsession-as-the-one-shared-domain-package) | `internal/session` as the one shared domain package | Accepted, provisional |
+| [ADR-0016](#adr-0016--stable-participant-identity-is-a-required-integration-contract) | Stable participant identity is a required integration contract | Accepted |
+| [ADR-0017](#adr-0017--no-cross-room-canonical-identity) | No cross-room canonical identity | Rejected |
+| [ADR-0018](#adr-0018--multi-tenancy-deferred) | Multi-tenancy deferred | Deferred |
+| [ADR-0019](#adr-0019--the-join-is-the-durable-unit-the-session-is-a-view) | The join is the durable unit; the session is a view | Accepted |
+| [ADR-0020](#adr-0020--ended_at-is-nullable-and-only-ever-set-from-an-observed-event) | `ended_at` is nullable and only ever set from an observed event | Accepted |
+| [ADR-0021](#adr-0021--no-settling-window-at-write-time) | No settling window at write time | Accepted |
+| [ADR-0022](#adr-0022--livekit-event-ingest-scope-room-lifecycle-stays-raw-only) | LiveKit event ingest scope; room lifecycle stays raw-only | Accepted |
+| [ADR-0023](#adr-0023--golang-migrate-as-the-migration-tool) | golang-migrate as the migration tool | Accepted |
+| [ADR-0024](#adr-0024--the-event-schema) | The event schema (supersedes ADR-0014) | Accepted |
 
 ---
 
@@ -333,10 +342,33 @@ Accepted knowingly:
 
 ### Revisit when
 
-Any of the following, **measured rather than suspected**:
+Any of the following, **measured rather than suspected**.
 
-- p95 for a bounded-range aggregate exceeds ~2s at the target event volume, with
-  correct indexes and confirmed partition pruning.
+Since [ADR-0024](#adr-0024--the-event-schema) the first trigger is stated in
+terms of the actual reference query rather than a generic row count. A row count
+alone does not describe this workload: the *open-join population* matters more
+than the total, because open joins are unbounded ranges (ADR-0020) and are the
+pathological case for the overlap index.
+
+**The reference query.** `participant_join` rows overlapping a bounded time
+range, windowed by `(backend, room_name, participant_identity)` with `lag()`
+computing reconnect gaps and a threshold applied (ADR-0019). Trigger: **p95
+above 2s**, with `EXPLAIN` confirming the GiST overlap index is in use, and
+reported together with **both** the `participant_join` row count **and the
+fraction of joins still open**. A result without the open fraction is not
+interpretable.
+
+*Baseline for comparison:* 66 ms at 200,000 joins with 5% open, for a 2-hour
+window, on PostgreSQL 16.15. At a 14-day window the planner already prefers a
+parallel sequential scan (83 ms), which is where the overlap index stops
+helping.
+
+**The drill-down query.** All `event_raw` rows for one
+`(room_name, participant_identity)` within a bounded range stops pruning to a
+small number of partitions, or exceeds p95 1s.
+
+**Unchanged:**
+
 - Hand-maintained rollup code grows past the complexity of adopting continuous
   aggregates.
 - Partition maintenance causes a second production incident.
@@ -851,7 +883,11 @@ protect.
 
 ## ADR-0014 — Event schema and migrations deliberately deferred
 
-**Status:** Open · 2026-08-25
+**Status:** **Superseded by [ADR-0024](#adr-0024--the-event-schema)** · 2026-08-25
+
+> Closed 2026-08-26. The schema landed; ADR-0024 records it. This entry is kept
+> unedited because the log is append-only, and because the reasoning for *not*
+> guessing early is the part worth preserving.
 
 ### Context
 
@@ -971,20 +1007,810 @@ one struct kept identical by the compiler.
 
 ---
 
+## ADR-0016 — Stable participant identity is a required integration contract
+
+**Status:** Accepted · 2026-08-26
+
+### Context
+
+Correlation has to know that two events describe the same participant. LiveKit
+supplies two identifiers. `identity` is chosen by the caller when an access
+token is minted. `sid` is assigned by LiveKit and is **new on every join** — a
+participant who reconnects four times has four SIDs — so it cannot answer "is
+this the same person as before".
+
+That leaves `identity`, which is caller-supplied and therefore only as good as
+the integrator's discipline.
+
+### Decision
+
+Stable identity is a **contract the integrator must meet**, not a problem the
+platform solves. Callers must supply a participant identity that is:
+
+- stable for a given user within a room, across reconnects, and
+- never reused for different users.
+
+The platform assumes the contract and does not attempt to verify it by
+inference.
+
+### Alternatives considered
+
+**Heuristic correlation when identity is unstable** — infer sameness from source
+IP, user agent, the timing proximity of a leave and a join, or track
+fingerprints. This is what a system that wants to "just work" against a sloppy
+integration does.
+
+*Rejected because it makes the system's central claim unverifiable.* Such
+correlation is wrong some unknown fraction of the time, and there is no ground
+truth to measure that fraction against — if we could tell which pairings were
+correct, we would not have needed the heuristic. This platform exists to say
+"this session had three reconnects". A heuristic turns that into "this session
+had three reconnects, probably, with an error rate we cannot state". A number
+you cannot put an error bar on is not a measurement.
+
+**A fallback heuristic mode, used only when identity looks unstable** — keep the
+strict path for good integrations, degrade gracefully for bad ones.
+
+*Rejected, and this is the more tempting of the two.* Two correlation modes mean
+every result carries an invisible "how was this derived" caveat. A dashboard
+panel cannot show it, a query result does not carry it, and the person reading
+the number does not know which mode produced it. Worse, the mode is per-room and
+can change over time, so a single chart can silently mix both. One correlation
+rule that sometimes refuses to produce an answer is better than two rules that
+always produce an ambiguous one.
+
+**Mint the tokens ourselves so we control identity** — put the platform in the
+token path and derive identity there.
+
+*Rejected because* it puts an observability tool into the media backend's
+authentication path, which is a far larger integration than observing it. It
+also does not generalise: mediasoup has no token concept to intercept
+(ADR-0003).
+
+### The principle
+
+**Push ambiguity to the boundary rather than absorbing it.**
+
+Unstable identity is an integrator bug. At the boundary it is visible,
+attributable, and fixable at the point where tokens are minted — a small local
+change by someone with the context to make it. Absorbed into the platform, the
+same bug becomes a permanent distortion in every downstream query, invisible to
+everyone and fixable by no one.
+
+### Consequences
+
+- Violations are **surfaced, never repaired.** The write path detects and counts
+  suspected-unstable-identity patterns and emits them as a metric. It must never
+  attempt to fix them.
+- The counter is a *suspicion*, not a finding, and should be named like one. We
+  can be wrong about it in both directions.
+- Integrations that cannot supply stable identity produce data the platform will
+  describe accurately as unusable, rather than data it quietly guesses at.
+
+TODO(scope): the detection heuristic and its metric. Detecting a contract
+violation and repairing one are different acts; only the first is in scope, and
+the distinction is the entire point of this entry.
+
+### Revisit when
+
+- A backend appears with no caller-supplied identity at all, so the contract
+  cannot be stated in its terms. mediasoup is the likely candidate.
+- The suspicion metric fires broadly across integrators who are demonstrably
+  trying to comply, which would mean the contract is unstatable in practice
+  rather than merely unmet.
+
+---
+
+## ADR-0017 — No cross-room canonical identity
+
+**Status:** Rejected · 2026-08-26
+
+### Context
+
+The same participant identity can appear in two different rooms. It is natural
+to ask whether the platform should resolve those into one canonical user with a
+cross-room history.
+
+### Decision
+
+No. The correlation key is `(room, identity)`. The same identity in two rooms
+represents two separate things and is stored as two separate things. No
+canonical user entity exists.
+
+### Alternatives considered
+
+**Build a canonical user across rooms** — a `user` table, identity as an alias
+of it, sessions hanging off the user.
+
+*Rejected because it is a product question about users, not a systems question
+about sessions.* What counts as "the same user" depends entirely on the
+deployment. In one, identity is an authenticated account id and the answer is
+trivial. In another it is a display name and the answer is wrong. In a third,
+the same human deliberately uses different identities in different rooms. The
+platform has no basis on which to choose, and choosing wrongly is worse than not
+choosing: it produces a canonical entity that silently merges different people
+and offers no signal that it has done so.
+
+The cost of declining is low. **Anyone wanting cross-room analysis already has
+identity as a join key** and can write the query. Not building the entity does
+not remove the capability; it removes a pre-commitment to one definition of it.
+
+**A nullable `user_id` populated from an integrator-supplied mapping** — let each
+deployment answer the question for itself.
+
+*Rejected as premature rather than wrong.* It is the likely shape of the answer
+if an answer is ever needed. Adding it later is an additive migration; adding it
+now is a column nothing populates and a join nothing uses.
+
+### Consequences
+
+- Cross-room questions are answerable, but as ad-hoc SQL rather than as a
+  first-class dimension.
+- Identity uniqueness is scoped per room, which is precisely the property
+  ADR-0018 relies on when it observes that tenancy would scope identity
+  *further* rather than restructure anything.
+
+### Revisit when
+
+- **A concrete query we cannot answer without it.** Not "cross-room users would
+  be nice" — an actual question, written down, that identity-as-a-join-key
+  cannot express, or cannot answer at acceptable cost.
+
+---
+
+## ADR-0018 — Multi-tenancy deferred
+
+**Status:** Deferred · 2026-08-26
+
+### Context
+
+Multi-tenancy was previously carried as an open question, with a note that it
+affects partitioning and could not stay open long. This entry closes it as an
+explicit deferral rather than leaving it ambient.
+
+### Decision
+
+No tenant concept. No `tenant_id` column, no row-level security, no per-tenant
+partitioning.
+
+The significant part is not the deferral but the reason it is safe: **nothing in
+the current design is hostile to adding one later.** Identity uniqueness is
+already scoped per room (ADR-0017). A tenant dimension would scope it *further*
+— `(tenant, room, identity)` — which narrows an existing key rather than
+restructuring anything. The correlation model, the join model and the index
+shapes all survive that change; the migration would be additive plus a backfill
+of a constant.
+
+This is a deferral with a checked precondition, not a deferral by omission.
+
+### Alternatives considered
+
+**Add `tenant_id` now with a single default value** — costs almost nothing and
+avoids a backfill later.
+
+*Rejected because* "costs almost nothing" is how a schema accumulates columns
+nothing reads. Every query would carry a predicate that is always true, and
+every index would carry a leading column with exactly one distinct value — which
+is actively harmful rather than merely useless, since a constant leading column
+makes a btree index worse. A column that is present but unenforced also invites
+code that assumes it means something.
+
+**Schema-per-tenant or database-per-tenant** — strong isolation.
+
+*Rejected for now*, with a warning attached: this is the option most damaged by
+delay. It is a deployment topology rather than a column, and retrofitting it is
+genuinely hard. If isolation requirements arrive, re-open this decision *before*
+the row-level option gets chosen by default.
+
+**Row-level security on a tenant column** — the conventional answer.
+
+*Not rejected, merely not yet needed.* It is the likely shape if tenancy arrives
+as an application requirement rather than a compliance one.
+
+### Consequences
+
+- The platform is single-tenant. Serving more than one customer means running
+  more than one of it.
+- ADR-0024's partitioning is decided without a tenant dimension. If tenancy
+  arrives, partitioning by time stays correct and tenant becomes a leading index
+  column — not a partition key, unless isolation demands otherwise.
+
+### Revisit when
+
+- A deployment must serve more than one customer from one instance.
+- A compliance requirement demands data isolation, in which case start from the
+  schema-per-tenant option rather than the column.
+
+---
+## ADR-0019 — The join is the durable unit; the session is a view
+
+**Status:** Accepted · 2026-08-26
+
+### Context
+
+"Session" is the word in the project's name, so it is worth being exact about
+what it denotes. Three candidate definitions:
+
+1. the room's lifetime;
+2. a participant's presence in a room, delimited by the backend's per-join
+   identifier;
+3. a participant's presence in a room, spanning reconnects.
+
+Definition 3 is what a person means when they ask "how was that call?".
+
+### Decision
+
+Store **joins**. A join is one participant's presence in one room, from an
+observed start to an observed end. Reconnects produce separate joins, stored
+separately, **with the gaps between them intact**.
+
+A **session** — definition 3 — is derived at read time by grouping a
+participant's joins under a reconnect-gap threshold. The threshold is a query
+parameter with a configured default.
+
+The session is never stored.
+
+### Alternatives considered
+
+**Session = room lifetime.**
+
+*Rejected* on two counts. It averages away individual experience: a room in
+which one participant had a flawless hour and another reconnected nine times
+becomes one "session" with mediocre aggregate numbers, and those two experiences
+are exactly what the platform exists to distinguish. And the boundary is
+arbitrary in practice — rooms are frequently long-lived or reused across
+unrelated conversations, so "the room's lifetime" often does not correspond to
+anything a participant would recognise.
+
+**Session = participant-in-room delimited by the backend's per-join identifier
+(LiveKit's SID).**
+
+*Rejected*, and it is the most tempting option, because it is unambiguous: the
+backend hands you the boundary and no policy is required. It is rejected because
+that unambiguity is purchased by discarding the reconnect relationship. A user
+who reconnected four times becomes four sessions, each of which looks fine. The
+one number that describes their actual experience — dropped four times in twenty
+minutes — is not merely absent from the data, it is contradicted by it.
+
+**Apply the threshold at write time, hardcoded.**
+
+**Apply the threshold at write time, configured.**
+
+*Both rejected, and configuration does not fix the problem.* Either way a policy
+value is baked into stored rows. When the value changes — and it will, because
+thirty seconds is a guess — prior data remains stitched under the old rule with
+no marker recording which rows were produced under which value. The table then
+holds two incompatible interpretations of the same column with no way to
+separate them.
+
+This is the same class of error as ADR-0004's reasoning about the store: **it
+destroys the ability to ask the question later.** Once joins are merged the gaps
+are gone, and you cannot un-merge them.
+
+### The tension, stated plainly
+
+This pushes work to read time, which sits directly against the argument in
+ADR-0011 and `internal/ingest/webhook` that correlation belongs at write time.
+The two are not in conflict, but the boundary between them is load-bearing and
+later work depends on it being stated precisely:
+
+> **Correlating events into a coherent record is deterministic and belongs at
+> write time. Applying a policy threshold to group records is interpretive and
+> belongs at read time.**
+
+"These two events describe the same join" has one right answer, derivable from
+the events themselves, and recomputing it on every read would be waste. "These
+two joins are the same session" has no right answer independent of a chosen
+threshold, and freezing one choice destroys every other.
+
+The test to apply to any future pipeline stage: *if two reasonable people could
+choose different values and both be right, it is policy — and policy does not go
+in the table.*
+
+### Consequences
+
+- "How would these group at 30 seconds versus 120?" is a query against real
+  data, answerable on history from day one, rather than a migration and a wait.
+- Every session-shaped result must carry the threshold that produced it or it is
+  uninterpretable. `session.Session` carries a `Gap` field for exactly this
+  reason.
+- Read-time cost is higher: the grouping is a window function over the overlap
+  result on every query. ADR-0024 measures what that costs.
+
+### Revisit when
+
+- Read-time grouping becomes the dominant cost in the reference query and a
+  materialised grouping is needed. If so, materialise it **beside** the joins
+  under a named threshold, never in place of them.
+- A backend supplies the reconnect relationship directly, making the grouping
+  observed rather than inferred. That would move it to write time legitimately,
+  because it would no longer be policy.
+
+---
+
+## ADR-0020 — `ended_at` is nullable and only ever set from an observed event
+
+**Status:** Accepted · 2026-08-26
+
+### Context
+
+A join opens when a `participant_joined` is observed and closes when a
+`participant_left` is observed. Sometimes the second never arrives: the delivery
+is lost, the backend crashes, the network partitions. The obvious fix is a
+sweeper that closes joins older than some timeout.
+
+### Decision
+
+**No sweeper.** `ended_at` is nullable and is only ever written from an observed
+event. A NULL `ended_at` means *"still open, or we never found out"* — one
+honest state, not an error condition.
+
+`end_reason` records **how** the end was learned: `participant_left`,
+`room_finished`, or `inferred_timeout` (reserved, and currently never written).
+
+### Why the null is worth more than a guess
+
+A sweeper collapses the world into two states: ended, and not yet ended.
+Declining to sweep yields three:
+
+1. **Open and recent** — probably a live participant.
+2. **Open and stale** — an event was lost. This is a direct measurement of
+   delivery-path loss.
+3. **Closed, with a reason** — we know what happened, and how we learned it.
+
+A sweeper erases the middle case by converting it into the third with a
+fabricated timestamp. That case is the single most useful signal the write path
+produces about its own reliability, and it belongs on a dashboard rather than
+under a rug. ADR-0011 accepted that delivery is at-least-once and unordered;
+state 2 is how we find out what that actually costs in production.
+
+Distinguishing states 1 and 2 is a matter of *staleness*, which the reader
+computes from `started_at` with a cutoff appropriate to their question — the
+same reasoning as ADR-0019 and ADR-0021.
+
+### The exception, which is not inference
+
+`room_finished` closes every join still open in that room, with
+`end_reason = 'room_finished'`.
+
+This is not a timeout and not a guess. The backend is stating that the room is
+gone, and a participant cannot still be in a room that does not exist. The
+information is observed; it simply arrives about the room rather than about the
+participant.
+
+It stays a distinct `end_reason` rather than being folded into
+`participant_left` because the two carry different information. "Left" says
+something about the participant's behaviour. "Closed because the room ended"
+says nothing about the participant at all — and treating the second as the first
+would record a departure for someone who never departed, which is precisely the
+fabrication this entry exists to prevent.
+
+### Alternatives considered
+
+**A sweeper with a generous timeout** — close anything open for more than, say,
+24 hours.
+
+*Rejected* per the above. A generous timeout does not reduce the harm, it delays
+it: the fabricated row is just as fabricated a day later, and the measurement is
+just as erased.
+
+**A sweeper that writes `inferred_timeout` honestly** — mark the fabrication
+rather than hiding it.
+
+*Rejected, and this is the closest call in this entry.* It is genuinely better
+than a silent sweeper, and it is why the constant is reserved rather than
+absent. It is still rejected because it makes swept rows *look answered*. Every
+downstream query would then have to remember to exclude one `end_reason`, and
+the queries that forget would be silently wrong. A NULL cannot be forgotten — it
+forces the reader to decide what to do about it.
+
+**A separate `join_closed_by_timeout` table** — keep the observations clean and
+record inferences elsewhere.
+
+*Rejected as* the same thing with an extra join.
+
+### Consequences
+
+- Open joins accumulate for any integration with a lossy delivery path, without
+  bound if the loss is systemic. That is a true statement about that deployment,
+  and it should be alarming.
+- The overlap index treats an open join as `[started_at, ∞)`, so a large
+  population of stale open joins is also the pathological case for the primary
+  query's performance. ADR-0004's revisit trigger accounts for this explicitly.
+- `inferred_timeout` exists in the CHECK constraint and in the Go vocabulary but
+  is never written. If it ever is, this ADR is being reversed and should be
+  superseded first.
+
+### Revisit when
+
+- Stale open joins reach a share of the table that materially degrades the
+  reference query, *and* the cause is understood and unfixable at source. Even
+  then, prefer archiving them to closing them.
+
+---
+
+## ADR-0021 — No settling window at write time
+
+**Status:** Accepted · 2026-08-26
+
+### Context
+
+Events arrive late and out of order (ADR-0011), so a correlated record is never
+final — only settled. The usual mechanism is a settling window: hold a record
+mutable for N minutes, then treat it as final.
+
+### Decision
+
+No settling window at write time. Records are updated whenever a relevant event
+arrives, however late. Queries that want only settled data specify their own
+recency cutoff as a parameter.
+
+**The window is a property of the question, not of the data.** A dashboard
+showing the last 24 hours wants a different cutoff than a monthly report, and
+neither is more correct than the other. Same reasoning as ADR-0019's gap
+threshold.
+
+### Alternatives considered
+
+**A fixed settling window, after which records are frozen** — clean semantics,
+and it makes "is this final?" answerable from the row itself.
+
+*Rejected* for ADR-0019's reason: it bakes a policy value into stored state, and
+changing it leaves earlier data settled under the old rule with no way to tell
+which. It is in one respect worse than the gap-threshold case, because a late
+event arriving after the window would be *dropped* — choosing to lose real data
+in exchange for a semantic convenience.
+
+**A settling window that marks rather than freezes** — set a `settled_at` and
+keep accepting updates.
+
+*Rejected as* a column recording when we stopped paying attention, which no
+query needs. A reader wanting "records unlikely to change further" can express
+that as `started_at < now() - cutoff` from data already present.
+
+**Watermarks, as a stream processor would do it** — genuinely the rigorous
+answer to late data.
+
+*Rejected here because* watermarks are a property of a streaming runtime we
+deliberately do not have (ADR-0004 rejected Kafka plus a stream processor as
+premature). Approximating them in the database buys the complexity without the
+guarantees.
+
+### Consequences
+
+- Any query over recent data may see records that later change. Callers must
+  choose a cutoff deliberately; there is no safe default that relieves them of
+  the choice.
+- A late event can modify a record a dashboard has already displayed. This is
+  correct behaviour and should be stated on the dashboard, not engineered away.
+- Reproducing a past query result requires knowing both the time range and the
+  time the query was run.
+
+### Revisit when
+
+- A consumer genuinely requires immutable historical records — a billing or
+  compliance export. The answer then is a snapshot table with an explicit as-of
+  timestamp, not a settling window on live data.
+
+---
+## ADR-0022 — LiveKit event ingest scope; room lifecycle stays raw-only
+
+**Status:** Accepted · 2026-08-26
+
+### Context
+
+LiveKit emits eleven webhook types. Not all of them describe participant session
+experience, and the platform has to decide what it accepts.
+
+### Decision
+
+**Ingested and stored** — `room_started`, `room_finished`, `participant_joined`,
+`participant_left`, `track_published`, `track_unpublished`.
+
+**Rejected at the boundary, and counted** — `egress_started`, `egress_updated`,
+`egress_ended`, `ingress_started`, `ingress_ended`.
+
+**Unrecognised types are stored, not dropped.**
+
+**Room lifecycle events live only in `event_raw`. There is no `room` table.**
+
+### Why egress and ingress are rejected
+
+They describe recording, streaming and media injection — operations performed
+*on* a room, not experiences *of* a participant. No planned query reads them.
+
+The cost of storing them anyway is not merely disk. `event_raw` is the table
+whose ceiling ADR-0004 exists to measure. Padding it with events no query
+touches would make that measurement describe a workload we do not have, and the
+resulting number would be wrong in the direction that matters most — it would
+make plain PostgreSQL look worse than it actually is for the real job.
+
+The rejection is counted by type so the decision stays visible and reversible
+with evidence rather than from memory.
+
+### Why unrecognised types are stored anyway
+
+This looks inconsistent with the paragraph above, and the distinction is
+deliberate: **known-and-irrelevant is a decision; unknown is a surprise.**
+
+An unrecognised event type means the integration drifted — a LiveKit upgrade
+added something, or a mediasoup wrapper is emitting a shape nobody planned. That
+is exactly the moment the payload is worth having. A counter alone would tell us
+that a type appeared while destroying the only evidence of what it contained.
+Retaining it is the same instinct as ADR-0016's *surface, do not repair*.
+
+*Rejected alternative:* reject unknown types and count them by name. Cleaner
+intake, and it would keep `event_raw` to a predictable six types. Rejected
+because the first time that counter fires, the only useful question is "what was
+in it?" and the answer would be gone.
+
+### Why room lifecycle stays raw-only
+
+`room_finished` is read during correlation to close open joins (ADR-0020). That
+is a lookup against the event stream, not a durable aggregate anything queries
+directly.
+
+*Rejected alternative:* a `room` table with started and finished timestamps.
+Rejected because it would be a second durable entity carrying the same
+open/closed problem the join model already solves — and rooms are the entity
+ADR-0019 specifically rejected as a session boundary, for being long-lived and
+reused. Promoting them to a table invites exactly the aggregate-by-room analysis
+that decision rejects.
+
+### Consequences
+
+- Room-level reporting must be aggregated from joins, or read from raw events.
+- `event_raw` carries a small tail of unrecognised events, unbounded in *type*.
+  It is intake we do not control and should be monitored by type cardinality.
+
+### Revisit when
+
+- A query needs room attributes that cannot be derived cheaply from events.
+- Recording quality becomes part of "how was that session", at which point
+  egress events become session-relevant and this scope should be widened
+  deliberately rather than by accident.
+- The unrecognised-type tail stops being a tail.
+
+---
+
+## ADR-0023 — golang-migrate as the migration tool
+
+**Status:** Accepted · 2026-08-26
+
+### Context
+
+ADR-0014 deferred the choice along with the schema. The schema now exists
+(ADR-0024), and it needs a way to be applied and rolled back.
+
+### Decision
+
+`golang-migrate`, run as a container. Migrations are plain `.sql` files in
+paired `up`/`down` form under `migrations/`.
+
+They are applied automatically by a one-shot `migrate` service in docker
+compose, which runs once PostgreSQL is healthy and before either binary starts.
+`make migrate-up`, `migrate-down`, `migrate-reset`, `migrate-version` and
+`migrate-force` provide manual control.
+
+### Alternatives considered
+
+**goose** — supports Go migrations as well as SQL, which would let partition
+creation be written as a loop.
+
+*Rejected, and the reason is the interesting one.* That capability is a trap
+here. Partition creation is **recurring maintenance**, not schema change: it
+must run every day forever, not once per deploy. Writing it as a migration would
+make it *look* handled while quietly leaving the real obligation unmet.
+golang-migrate's inability to express it enforces the boundary correctly — the
+job has to live somewhere else, which is where it belongs.
+
+**Atlas** — declarative schema-as-code, with real diffing and migration linting.
+
+*Rejected as* heavier than this project currently needs, and partly commercial.
+It is the strongest option if the schema grows enough that hand-written diffs
+become error-prone, and it is the first place to look if that happens.
+
+**sqitch** — dependency-ordered rather than linear, with excellent reversibility
+discipline.
+
+*Rejected on* its Perl runtime and its unfamiliarity to the likely reader of
+this repository.
+
+**No tool at all; a hand-applied `schema.sql`** — briefly tempting for a project
+this young.
+
+*Rejected because* the reversibility requirement is real. This schema will be
+revised repeatedly as ADR-0024 is revisited, and being able to roll back and
+re-apply cleanly is what keeps that cheap.
+
+### Consequences
+
+- **The dirty-state behaviour is genuinely annoying**, and worth warning about
+  rather than discovering: a migration that fails part-way leaves the version
+  table marked dirty and refuses to proceed until `migrate force <version>`
+  clears it — which requires knowing what actually applied.
+  `make migrate-force VERSION=n` exists for this and should be used with the
+  schema in front of you, never reflexively.
+- No Go dependency is needed to apply migrations, so `internal/database` stays
+  driver-free until there is a query to run. ADR-0014's reasoning on that point
+  survives its supersession.
+- Partition maintenance is **not** covered by this tool, by design. TODO(scope).
+
+### Revisit when
+
+- Hand-written diffs start producing migration bugs, at which point Atlas's
+  diffing earns its weight.
+- Migrations need to be applied by the application itself rather than a sidecar
+  — for example from a Kubernetes init container (ADR-0012).
+
+---
+
+## ADR-0024 — The event schema
+
+**Status:** Accepted · 2026-08-26 · **Supersedes ADR-0014**
+
+### Context
+
+ADR-0014 deliberately deferred the schema so that no plausible-looking guess
+would be committed and built upon. This entry closes it.
+
+The decisions here are consequences of ADR-0016 through ADR-0022, not
+independent choices. Read those first; this is the shape they imply.
+
+### Decision
+
+Two tables.
+
+**`event_raw`** — append-only intake, partitioned daily by `occurred_at`. Typed
+columns for the correlation keys, `payload jsonb` for everything else.
+
+**`participant_join`** — the durable unit (ADR-0019). Not partitioned.
+
+#### Partition key and granularity
+
+`occurred_at` — the backend's own clock, not arrival time, because arrival order
+is not event order (ADR-0011) and nothing may order by arrival.
+
+**Daily.** Retention is measured in weeks, so daily granularity lets retention be
+expressed to the day, keeps partition count near 60 at an eight-week window, and
+prunes tightly for the drill-down query, which is typically scoped to hours.
+
+- *Weekly rejected* — carries up to six extra days past the retention boundary
+  and prunes far more coarsely.
+- *Monthly rejected* — incoherent at weeks-scale retention.
+- *Hourly rejected* — roughly 1,300 partitions at eight weeks, where planning
+  overhead starts to matter and the maintenance job's failure modes multiply, in
+  exchange for pruning finer than any expected query needs.
+
+#### No DEFAULT partition
+
+A default partition would prevent insert failures when the maintenance job falls
+behind. *Rejected:* it silently absorbs misrouted rows, and every later `ATTACH`
+must scan it. ADR-0004 already accepted that forgetting the maintenance job is
+an outage; a default partition converts a loud outage into quiet wrongness,
+which is the trade this project consistently refuses (ADR-0016, ADR-0020).
+
+#### Why `participant_join` is not partitioned
+
+Partitioning it by `started_at` would defeat pruning on the primary query. A
+join that started long ago and is still open (ADR-0020) must be found by any
+later time window, so an overlap search could never prune below "every partition
+up to the range end" — unless a second predicate bounded `started_at`, and
+adding that predicate would silently drop long-running sessions from results.
+
+The two tables get different treatment because they are queried differently, not
+because one matters more.
+
+#### Idempotency
+
+On `event_raw`: the primary key `(occurred_at, event_id)`, where `event_id` is
+**derived, never copied** — uuidv5 over `(backend, backend_event_id)`, or over
+the canonical tuple for backends that supply no event id. A duplicate delivery
+derives the same id and conflicts, so the receiver uses `ON CONFLICT DO NOTHING`
+and needs no dedup table. A partitioned table's unique constraints must include
+the partition key, which is why the PK is a pair.
+
+On `participant_join`: a unique constraint on `started_event_id`.
+
+*Rejected:* a partial unique index on
+`(backend, room_name, participant_identity) WHERE ended_at IS NULL`, to prevent
+duplicate open joins. It is wrong. When a `participant_left` is lost the join
+stays open (ADR-0020), and that index would turn the participant's **next
+legitimate join** into an insert failure — converting a measurement into an
+outage. Multiple open joins for one `(room, identity)` are permitted, and
+counted as a metric.
+
+#### `active_range` and the overlap index
+
+`participant_join.active_range` is a generated
+`tstzrange(started_at, ended_at, '[)')`. An open join becomes `[started_at, )` —
+unbounded above — so it overlaps any later window with no NULL handling at the
+call site.
+
+*Rejected:* btree indexes on `started_at` and `ended_at` with an explicit
+`started_at < $2 AND (ended_at IS NULL OR ended_at > $1)` predicate. Correct,
+but the NULL branch is easy to omit, and omitting it silently excludes exactly
+the open joins ADR-0020 exists to make visible. Encoding the semantics in the
+type removes the opportunity to get it wrong.
+
+#### Indexes, and what each measurably earns
+
+Measured on 200,000 joins across 4,000 rooms with 5% left open (78 MB),
+PostgreSQL 16.15:
+
+| Index | Serves | Measured |
+|---|---|---|
+| `participant_join_active_range_idx` (GiST) | overlap filter in the reference query | bitmap index scan; 10,000 rows from a 2-hour window; 66 ms total |
+| `participant_join_window_idx` (btree) | per-`(room, identity)` drill-down | index scan, 0.22 ms |
+| `participant_join_open_idx` (partial btree) | the open-and-stale panel (ADR-0020) | index-only scan, 0 heap fetches, 2.0 ms for 10,000 open joins |
+| `event_raw_pkey` | partition pruning; idempotent insert | — |
+| `event_raw_participant_idx` | per-session drill-down into raw events | — |
+
+**One correction, recorded because the reasoning was wrong before it was
+measured.** `participant_join_window_idx` was chosen expecting it to supply the
+reference query's window frame in index order and thereby avoid a sort. It does
+not. The overlap predicate drives the plan, producing a bitmap heap scan, after
+which index order is gone and PostgreSQL sorts — 39 ms of the 66 ms. The index
+is kept because it decisively serves a *different* real query (per-`(room,
+identity)` drill-down, 0.22 ms), but the original justification was wrong and
+the sort remains in the plan.
+
+At a 14-day window the planner correctly abandons the GiST index for a parallel
+sequential scan (83 ms). That is the right choice at that selectivity, and it
+marks where the overlap index stops helping.
+
+`event_raw` gets only two indexes: it is the append path ADR-0011 requires to
+stay fast, and every index is paid on every insert.
+
+#### What is canonical, and what stays JSONB
+
+**Canonical** (typed columns): `backend`, `event_type`, `occurred_at`,
+`room_name`, `room_sid`, `participant_identity`, `participant_sid`, `track_sid`.
+These are exactly what correlation keys on.
+
+**JSONB**: everything else, retained in full, because mediasoup's events will not
+share LiveKit's shape (ADR-0003) and a column set fitted to LiveKit would make
+LiveKit's model the canonical model — the failure ADR-0014 named explicitly.
+
+The boundary rule: **a field becomes a column when a query filters or joins on
+it, not when it looks important.** Promoting a field later is an additive
+migration; demoting one is not.
+
+### Consequences
+
+- Partition maintenance is now a live obligation. Until the recurring job
+  exists, the bootstrap window in migration `000002` is finite and inserts past
+  its end **will fail**. TODO(scope).
+- Retention remains undecided. Daily granularity assumes weeks and would want
+  revisiting if the answer turned out to be months.
+- The reference query's cost scales with the open-join population, because open
+  joins are unbounded ranges.
+- `internal/database` still has no driver, because there is still no query to
+  run. Correlation and the query API remain out of scope.
+
+### Revisit when
+
+See ADR-0004, whose revisit trigger is now stated in terms of this schema's
+reference query rather than generic row counts.
+
+---
 ## Open questions
 
 Not yet decisions. Listed so they are not mistaken for oversights.
 
+Four entries left this list on 2026-08-26: session-end semantics became
+ADR-0020, the settling window became ADR-0021, canonical identity became
+ADR-0017, and multi-tenancy became ADR-0018.
+
 - **Correlation trigger.** Does the pipeline run on a schedule, on a queue, or
-  incrementally per event? Depends on ADR-0014.
-- **Session end semantics.** Every rule for closing an idle session is wrong in
-  some way; the question is which failure is acceptable and how it is surfaced
-  to the reader of a dashboard.
-- **Settling window.** How long a correlated timeline stays mutable before it is
-  treated as final, and how a late event that arrives after settling is handled.
-- **Canonical identity.** How a globally unique, time-stable session identity is
-  derived from backend-supplied identifiers that are neither.
-- **Multi-tenancy.** Whether tenant is a first-class dimension. It affects the
-  partitioning strategy, so it cannot stay open long after ADR-0014 closes.
-- **Retention policy.** ADR-0004 assumes weeks. The actual number is a product
-  decision that has not been made.
+  incrementally per event? Now unblocked by ADR-0024 and the next thing to
+  decide.
+- **Partition maintenance mechanism.** Partitions must be created ahead of time
+  or inserts fail (ADR-0024), and ADR-0023 deliberately keeps this out of the
+  migration tool. Whether it is `pg_cron`, a Kubernetes CronJob, or a loop in
+  the ingester is undecided — but it is an obligation now, not a future one.
+- **The default reconnect gap.** ADR-0019 makes the threshold a query parameter
+  with a configured default. The default's *value* is a guess nobody has
+  justified yet, and picking it deserves data the platform can now collect.
+- **Retention policy.** ADR-0004 assumes weeks and ADR-0024's daily partitioning
+  is sized for that. The actual number is a product decision still unmade.

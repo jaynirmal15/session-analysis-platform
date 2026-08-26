@@ -6,5 +6,8 @@
 // and single-session lookups. Collapsing them into one interface produces a
 // type that is a union of two unrelated needs and satisfies neither well.
 //
-// TODO(scope): deferred with the schema (ADR-0014).
+// TODO(scope): the port interface. The tables now exist (ADR-0024) and the
+// primary query is known — joins overlapping a bounded range, windowed by
+// (backend, room, identity), grouped under a caller-supplied gap threshold
+// (ADR-0019) — but no query code is written yet.
 package store

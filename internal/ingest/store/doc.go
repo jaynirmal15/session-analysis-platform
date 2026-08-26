@@ -10,6 +10,7 @@
 // idempotent insert on a stable event identity, and bulk paths that do not
 // hold a transaction open across a correlation pass.
 //
-// TODO(scope): the port interface depends on the event schema and is deferred
-// with it (ADR-0014).
+// TODO(scope): the port interface. The tables it writes to now exist
+// (ADR-0024) — event_raw for intake, participant_join for the durable unit —
+// but no persistence code is written yet.
 package store

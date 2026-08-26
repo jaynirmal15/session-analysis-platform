@@ -7,10 +7,10 @@ It ingests lifecycle events from real-time media backends, correlates them into
 per-session timelines, and exposes both aggregate metrics across the fleet and
 drill-down into any individual session.
 
-> **Status: scaffolding.** The repository structure, local development stack and
-> decision log are in place. There is no business logic yet — no schema, no
-> webhook handling, no correlation. See [Current status](#current-status) for
-> exactly what does and does not work today.
+> **Status: schema, no behaviour.** The repository structure, local development
+> stack, decision log and now the database schema are in place. There is still
+> no business logic — nothing receives a webhook, nothing correlates. See
+> [Current status](#current-status) for exactly what does and does not work.
 
 ---
 
@@ -32,6 +32,12 @@ fleet-wide question and the single-session question, from the same event stream.
 Three of these matter enough to state up front, because they shape everything
 else:
 
+- **The join is stored; the session is derived.** A "session" — a participant
+  in a room, spanning reconnects — is never a row. Joins are stored with their
+  gaps intact and grouped at read time under a threshold you pass in, so
+  "how would these group at 30 seconds instead of 120?" is a query rather than
+  a migration. Applying that threshold at write time would destroy the ability
+  to ask the question later.
 - **The media backend is pluggable, and that claim gets tested.** LiveKit is the
   first backend. mediasoup is the second, chosen specifically because it is
   architecturally unlike LiveKit — a library rather than a server, with no
@@ -88,6 +94,56 @@ it makes the schema an interface with more than one consumer. See
 
 ---
 
+## Data model
+
+Two tables. The full reasoning is
+[ADR-0024](ARCHITECTURE.md#adr-0024--the-event-schema); the SQL in
+[`migrations/`](migrations) carries it inline as well.
+
+**`event_raw`** — every accepted webhook, append-only, partitioned daily by the
+backend's own event time. Typed columns for the eight fields correlation keys
+on; `payload jsonb` keeps the rest, because mediasoup's events will not share
+LiveKit's shape. A field earns a column when a query filters on it, not when it
+looks important.
+
+**`participant_join`** — the durable unit. One participant's presence in one
+room, from an observed start to an observed end.
+
+Three properties of that table do most of the work:
+
+- **`ended_at` is nullable and no sweeper ever fills it in.** NULL means "still
+  open, or we never found out". That gives three states rather than two —
+  open-and-recent, open-and-stale, and closed-with-a-reason — and the middle one
+  is a direct measurement of how much your delivery path is losing. A sweeper
+  would erase exactly that signal
+  ([ADR-0020](ARCHITECTURE.md#adr-0020--ended_at-is-nullable-and-only-ever-set-from-an-observed-event)).
+- **`end_reason` records how the end was learned**, not just that it happened.
+  `room_finished` is not the same information as `participant_left`.
+- **Overlap is indexed with GiST over a generated `tstzrange`.** An open join
+  becomes `[started_at, )`, so it overlaps any later window with no NULL
+  handling at the call site — the branch that is easy to forget, and whose
+  omission would silently hide the open joins that matter most.
+
+The correlation key is `(room, identity)`. Identity is caller-supplied and its
+stability within a room is
+[a contract you must meet](ARCHITECTURE.md#adr-0016--stable-participant-identity-is-a-required-integration-contract):
+LiveKit's participant SID is new on every join and cannot serve. Violations are
+counted and surfaced, never guessed at and repaired.
+
+### Events consumed
+
+Ingested: `room_started`, `room_finished`, `participant_joined`,
+`participant_left`, `track_published`, `track_unpublished`.
+
+Rejected and counted: everything egress and ingress — they describe operations
+performed *on* a room, not experiences *of* a participant, and storing them
+would distort the very volume measurement this project exists to take.
+Unrecognised types are stored anyway, because an unknown type is evidence the
+integration drifted and a counter alone would destroy it
+([ADR-0022](ARCHITECTURE.md#adr-0022--livekit-event-ingest-scope-room-lifecycle-stays-raw-only)).
+
+---
+
 ## Running it locally
 
 **Requirements:** Docker with Compose v2, and Go 1.25+ if you want to run the
@@ -101,6 +157,12 @@ That builds both service images and starts the full stack. Every value has a
 working default, so no `.env` file is needed; copy `.env.example` to `.env` if
 you want to override ports or credentials.
 
+Migrations apply automatically: a one-shot `migrate` service runs once
+PostgreSQL is healthy, and both binaries wait for it to succeed — so the step is
+visible in compose output rather than hidden inside application startup. Use
+`make migrate-up` / `migrate-down` / `migrate-version` for manual control, and
+`make psql` for a shell on the database.
+
 | Service | URL | Notes |
 |---|---|---|
 | Grafana | http://localhost:3000 | `admin` / `admin`; both datasources pre-provisioned |
@@ -109,7 +171,7 @@ you want to override ports or credentials.
 | OTel Collector | localhost:4317 | OTLP gRPC in; `:8889` metrics out |
 | ingester | http://localhost:8080/healthz | health endpoint only, for now |
 | queryapi | http://localhost:8081/healthz | health endpoint only, for now |
-| PostgreSQL | localhost:5432 | `sap` / `sap` / `sap`; **empty, no schema** |
+| PostgreSQL | localhost:5432 | `sap` / `sap` / `sap`; migrated on startup |
 
 ### Verifying it works
 
@@ -133,6 +195,14 @@ Prometheus labels.
 `go_goroutine_count` works the same way. Prometheus **Status → Target health**
 should show four jobs, all `UP`: `prometheus`, `otel-collector-pipeline`,
 `otel-collector-internal` and `livekit`.
+
+To confirm the schema applied:
+
+```bash
+make migrate-version
+```
+
+It should print `3`. Both tables are empty — nothing writes to them yet.
 
 ### The other local workflow
 
@@ -168,26 +238,32 @@ make help
 
 **Works today:**
 
-- Full local stack comes up with `docker compose up`, wired end to end.
+- Full local stack comes up with `docker compose up`, wired end to end,
+  migrations applied.
 - Both binaries boot, serve `/healthz`, and export OpenTelemetry metrics through
   the collector to Prometheus.
 - Grafana has both datasources provisioned and connected.
-- Package structure with a documented responsibility per package.
-- The decision log, seeded with fifteen entries.
+- The schema: two tables, daily partitioning, three purpose-chosen indexes, all
+  reversible. Verified up → down → up against a running PostgreSQL 16.
+- Domain vocabulary in `internal/session`, matching the schema.
+- The decision log, now twenty-four entries.
 
 **Deliberately absent** — each has a `TODO(scope)` marker in the package where
 it will land:
 
-- The canonical event schema and any database migrations.
 - Webhook receipt, signature verification and payload handling.
 - The media-backend adapter interface. Not stubbed either: a placeholder
   interface gets implemented against, and then it is not a placeholder.
-- Correlation logic.
+- Correlation logic — the thing that would actually put rows in these tables.
 - Query API handlers and Grafana dashboards.
+- Store ports and a PostgreSQL driver. There is still no query to run, and a
+  driver chosen before it is used is a driver chosen without evidence.
 
-The schema is being designed separately. See
-[ADR-0014](ARCHITECTURE.md#adr-0014--event-schema-and-migrations-deliberately-deferred)
-for why nothing plausible-looking was committed in the meantime.
+**One live obligation, worth knowing before you run this for real.** Partitions
+must exist ahead of time or inserts fail, there is no `DEFAULT` partition to
+absorb the overflow, and the recurring job that keeps the window ahead of `now()`
+does not exist yet. Migration `000002` creates a finite bootstrap window and
+nothing extends it. See [`migrations/README.md`](migrations/README.md).
 
 ---
 
@@ -213,7 +289,7 @@ internal/
   query/               READ PATH
     api/               aggregate + drill-down handlers
     store/             read-side persistence port
-migrations/            empty on purpose
+migrations/            golang-migrate .sql pairs, up and down
 deploy/                compose service configuration
 ```
 
@@ -235,31 +311,40 @@ are written from [ARCHITECTURE.md](ARCHITECTURE.md).
 **Phase 0 — Scaffolding · done**
 Repository structure, local stack, telemetry path, decision log.
 
-**Phase 1 — Schema and ingest**
-Canonical event model. Partitioned tables and partition management. LiveKit
-webhook receipt with signature verification. Durable-receipt-then-acknowledge,
-because retries are backpressure.
+**Phase 1 — Schema · done**
+Canonical event model, partitioned tables, reversible migrations, and the eight
+decisions behind them (ADR-0016 to ADR-0024). Notably: what a session *is*, and
+why it is not a row.
 
-**Phase 2 — Correlation**
-Events to session timelines. The hard parts up front: idempotency under
-at-least-once delivery, out-of-order arrival, and deciding when a session that
-has stopped emitting events is actually over.
+**Phase 2 — Ingest**
+LiveKit webhook receipt with signature verification.
+Durable-receipt-then-acknowledge, because retries are backpressure. Partition
+maintenance, which is now an obligation rather than a plan.
 
-**Phase 3 — Query and dashboards**
-Aggregate and drill-down endpoints. The two Grafana dashboards. First real
-numbers on query cost.
+**Phase 3 — Correlation**
+Events to joins. The hard parts up front: idempotency under at-least-once
+delivery and out-of-order arrival. Note that two problems normally solved here
+were solved by decision instead — sessions are not stitched at write time
+(ADR-0019), and no sweeper closes joins by timeout (ADR-0020).
 
-**Phase 4 — The second backend**
+**Phase 4 — Query and dashboards**
+Aggregate and drill-down endpoints. The two Grafana dashboards, including the
+open-and-stale panel that measures how much the delivery path is losing. First
+real numbers on query cost against non-synthetic data.
+
+**Phase 5 — The second backend**
 mediasoup. The point at which the adapter abstraction is either validated or
 shown to have leaked. Either outcome is a result.
 
-**Phase 5 — The PostgreSQL ceiling**
+**Phase 6 — The PostgreSQL ceiling**
 Load generation, measurement, and finding where plain partitioned PostgreSQL
-stops being enough. The revisit triggers in
+stops being enough. The revisit trigger in
 [ADR-0004](ARCHITECTURE.md#adr-0004--plain-partitioned-postgresql-not-timescaledb)
-are the acceptance criteria.
+is the acceptance criterion, and it is now stated in terms of the actual
+reference query — with the open-join fraction reported alongside, because open
+joins are unbounded ranges and are that query's pathological case.
 
-**Phase 6 — Kubernetes**
+**Phase 7 — Kubernetes**
 Manifests, independent scaling of ingest and correlation, and whatever ADR-0006
 turns out to have got wrong.
 
