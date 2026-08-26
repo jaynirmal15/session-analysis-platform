@@ -1,0 +1,2 @@
+# Grafana reads every provisioning subdirectory at boot and logs an error for
+# any that is missing. Kept empty so a first run produces a clean log.
