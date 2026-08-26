@@ -1,0 +1,153 @@
+# Local development stack for the session analysis platform.
+#
+#   docker compose up          — everything, including both service binaries
+#   make infra-up              — dependencies only, for `make run-local`
+#
+# Every value has a default, so this file works with no .env present. Copy
+# .env.example to .env to override. Nothing here is production configuration;
+# Kubernetes manifests are a later phase (ADR-0012).
+
+name: session-analysis-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sap}
+      POSTGRES_DB: ${POSTGRES_DB:-sap}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sap} -d ${POSTGRES_DB:-sap}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # TODO(scope): no migrations are mounted. The schema is being designed
+    # separately (ADR-0014); this database comes up empty on purpose.
+
+  livekit:
+    image: livekit/livekit-server:v1.9
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./deploy/livekit/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "${LIVEKIT_PORT:-7880}:7880"   # signalling / HTTP API
+      - "7881:7881"                    # RTC over TCP
+      - "50000-50020:50000-50020/udp"  # RTC over UDP
+    # NOTE: on macOS and Windows, Docker Desktop has no host networking, so
+    # published UDP works but LiveKit cannot discover a usable external IP and
+    # actual media will not flow reliably. Signalling, the HTTP API and — the
+    # part that matters here — webhook delivery all work. See README.
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.140.0
+    restart: unless-stopped
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./deploy/otel/collector.yaml:/etc/otel/collector.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC — also how `make run-local` reaches it
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus exporter: application metrics
+      - "8888:8888"   # the collector's own metrics
+
+  prometheus:
+    image: prom/prometheus:v3.6.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Consumed by the provisioned PostgreSQL datasource.
+      POSTGRES_USER: ${POSTGRES_USER:-sap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sap}
+      POSTGRES_DB: ${POSTGRES_DB:-sap}
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+      - postgres
+
+  ingester:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        BINARY: ingester
+        VERSION: ${VERSION:-dev}
+    restart: unless-stopped
+    environment:
+      SAP_LISTEN_ADDR: ":8080"
+      SAP_OTLP_ENDPOINT: otel-collector:4317
+      SAP_OTLP_INSECURE: "true"
+      SAP_ENVIRONMENT: ${SAP_ENVIRONMENT:-local}
+    ports:
+      - "${INGESTER_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  queryapi:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        BINARY: queryapi
+        VERSION: ${VERSION:-dev}
+    restart: unless-stopped
+    environment:
+      SAP_LISTEN_ADDR: ":8081"
+      SAP_OTLP_ENDPOINT: otel-collector:4317
+      SAP_OTLP_INSECURE: "true"
+      SAP_ENVIRONMENT: ${SAP_ENVIRONMENT:-local}
+    ports:
+      - "${QUERYAPI_PORT:-8081}:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build -trimpath ./...
+
+      - name: test
+        run: go test -race -count=1 ./...
+
+  compose:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Cheap guard against the local stack rotting: the compose file and the
+      # Dockerfiles must at least remain valid and buildable. Actually running
+      # the stack in CI is deferred until there is behaviour worth asserting.
+      - name: validate compose file
+        run: docker compose config -q
+
+      - name: build service images
+        run: docker compose build ingester queryapi

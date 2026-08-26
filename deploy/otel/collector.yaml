@@ -1,0 +1,57 @@
+# OpenTelemetry Collector configuration for local development.
+#
+# The services push OTLP/gRPC here; Prometheus scrapes the result. See
+# ADR-0006 for why the collector sits in the path at all rather than each
+# service exposing /metrics for Prometheus to scrape directly.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bounds collector memory so a burst of ingest telemetry cannot take the
+  # collector down with the thing it is observing.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  # Pull-based: the collector exposes an aggregated /metrics for Prometheus.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      # Promotes service.name / service.version to labels so panels can split
+      # by service without a join.
+      enabled: true
+
+  # TODO(scope): traces currently go nowhere but the log. Adding Tempo is a
+  # change to this file plus one compose service — the application does not
+  # move. That reversibility is the argument in ADR-0007.
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
