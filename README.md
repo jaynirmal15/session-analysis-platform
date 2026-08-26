@@ -117,10 +117,22 @@ you want to override ports or credentials.
 curl -s localhost:8080/healthz && curl -s localhost:8081/healthz
 ```
 
-Then open Prometheus and query `otel_scope_info` or any `runtime_*` series. The
-services export Go runtime metrics, which is how the whole path — application →
-collector → Prometheus → Grafana — is verifiable before there is any domain
-metric to look at.
+Then open Prometheus and run:
+
+```promql
+sum by (service_name) (go_memory_used_bytes)
+```
+
+You should get two series, `sap-ingester` and `sap-queryapi`. That single query
+exercises the entire telemetry path — the SDK in each process, OTLP to the
+collector, the collector's Prometheus exporter, and the scrape — before any
+domain metric exists to look at. The `service_name` label arrives because the
+collector is configured to promote OpenTelemetry resource attributes to
+Prometheus labels.
+
+`go_goroutine_count` works the same way. Prometheus **Status → Target health**
+should show four jobs, all `UP`: `prometheus`, `otel-collector-pipeline`,
+`otel-collector-internal` and `livekit`.
 
 ### The other local workflow
 

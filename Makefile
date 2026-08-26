@@ -101,6 +101,8 @@ infra-down:
 ## run-local: dependencies in compose, ingester on the host (foreground)
 .PHONY: run-local
 run-local: infra-up
+	@# Free the port in case `make up` left the containerised one running.
+	@docker compose stop ingester >/dev/null 2>&1 || true
 	@echo "==> ingester on the host, exporting to $(LOCAL_OTLP_ENDPOINT)"
 	SAP_OTLP_ENDPOINT=$(LOCAL_OTLP_ENDPOINT) \
 	SAP_OTLP_INSECURE=true \
@@ -110,6 +112,7 @@ run-local: infra-up
 ## run-local-api: dependencies in compose, queryapi on the host (foreground)
 .PHONY: run-local-api
 run-local-api: infra-up
+	@docker compose stop queryapi >/dev/null 2>&1 || true
 	@echo "==> queryapi on the host, exporting to $(LOCAL_OTLP_ENDPOINT)"
 	SAP_OTLP_ENDPOINT=$(LOCAL_OTLP_ENDPOINT) \
 	SAP_OTLP_INSECURE=true \
