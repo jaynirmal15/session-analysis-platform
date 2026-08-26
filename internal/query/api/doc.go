@@ -13,6 +13,11 @@
 // per-session panels (ADR-0008), so this API is not the only consumer of the
 // schema. Anything this package treats as a private detail is not private.
 //
-// TODO(scope): handlers, routing and the response contract are out of scope
-// pending the schema (ADR-0014).
+// Every session-shaped response must carry the gap threshold that produced it.
+// A Session grouped at 30s and the same joins grouped at 120s are both correct
+// and are different answers, so a response without its threshold is
+// uninterpretable (ADR-0019). Likewise, queries wanting settled data must pass
+// their own recency cutoff — there is no write-time settling window (ADR-0021).
+//
+// TODO(scope): handlers, routing and the response contract.
 package api

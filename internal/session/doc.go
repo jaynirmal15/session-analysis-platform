@@ -15,8 +15,18 @@
 // type in this package can only be produced by one backend, that type belongs
 // in that backend's adapter instead.
 //
-// TODO(scope): the canonical event and session types are being designed
-// separately and are intentionally absent. Nothing in this repository should
-// guess at them — a guessed schema that ships is a schema that gets built on.
-// See ADR-0014.
+// The vocabulary now exists (ADR-0024). Two things in it are worth knowing
+// before reading the types:
+//
+// A Join is durable and a Session is not. Sessions are derived at read time by
+// grouping a participant's joins under a reconnect-gap threshold, so Session
+// carries the Gap that produced it — the same joins grouped at 30s and at 120s
+// are two correct and different answers (ADR-0019).
+//
+// A nil EndedAt means "still open, or we never found out". It is never filled
+// in by a sweeper, because the difference between a live participant and a lost
+// event is a measurement worth keeping (ADR-0020).
+//
+// TODO(scope): nothing here is persisted or read yet. The store ports, the
+// correlation stage and the query handlers are all still unwritten.
 package session

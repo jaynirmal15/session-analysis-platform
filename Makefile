@@ -17,7 +17,7 @@ GO_PACKAGES := ./...
 BIN_DIR     := bin
 
 # Dependency services, i.e. everything except our own binaries.
-INFRA_SERVICES := postgres livekit otel-collector prometheus grafana
+INFRA_SERVICES := postgres migrate livekit otel-collector prometheus grafana
 
 # The host-side view of the collector, for `run-local`. Inside compose the
 # services use otel-collector:4317 instead.
@@ -75,6 +75,53 @@ tidy:
 ## check: everything CI runs — fmt-check, vet, build, test
 .PHONY: check
 check: fmt-check vet build test
+
+# --- Migrations -------------------------------------------------------------
+#
+# golang-migrate, run as a container so no Go dependency is needed to apply
+# schema changes (ADR-0023). `docker compose up` applies them automatically via
+# the one-shot migrate service; these targets are for manual control.
+
+POSTGRES_USER     ?= sap
+POSTGRES_PASSWORD ?= sap
+POSTGRES_DB       ?= sap
+
+# Deferred (=) not immediate (:=), so overriding POSTGRES_* on the command line
+# still reaches the URL.
+MIGRATE = docker compose run --rm --entrypoint migrate migrate \
+	-path=/migrations \
+	-database=postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/$(POSTGRES_DB)?sslmode=disable
+
+## migrate-up: apply all pending migrations
+.PHONY: migrate-up
+migrate-up:
+	$(MIGRATE) up
+
+## migrate-down: roll back exactly one migration
+.PHONY: migrate-down
+migrate-down:
+	$(MIGRATE) down 1
+
+## migrate-reset: roll back every migration (destroys all data)
+.PHONY: migrate-reset
+migrate-reset:
+	$(MIGRATE) down -all
+
+## migrate-version: print the current schema version
+.PHONY: migrate-version
+migrate-version:
+	$(MIGRATE) version
+
+## migrate-force: clear a dirty state by pinning VERSION (see ADR-0023)
+.PHONY: migrate-force
+migrate-force:
+	@test -n "$(VERSION)" || (echo "usage: make migrate-force VERSION=<n>" >&2; exit 1)
+	$(MIGRATE) force $(VERSION)
+
+## psql: open a psql shell on the development database
+.PHONY: psql
+psql:
+	docker compose exec postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB)
 
 # --- Local development ------------------------------------------------------
 

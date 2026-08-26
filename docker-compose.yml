@@ -26,8 +26,23 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    # TODO(scope): no migrations are mounted. The schema is being designed
-    # separately (ADR-0014); this database comes up empty on purpose.
+
+  # One-shot: applies migrations, then exits. The service binaries wait for it
+  # to complete successfully, which keeps `docker compose up` end to end and
+  # makes the migration step visible in compose output rather than hidden
+  # inside an application's startup path. See ADR-0023.
+  migrate:
+    image: migrate/migrate:v4.19.0
+    restart: "no"
+    command:
+      - -path=/migrations
+      - -database=postgres://${POSTGRES_USER:-sap}:${POSTGRES_PASSWORD:-sap}@postgres:5432/${POSTGRES_DB:-sap}?sslmode=disable
+      - up
+    volumes:
+      - ./migrations:/migrations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   livekit:
     image: livekit/livekit-server:v1.9
@@ -111,6 +126,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       otel-collector:
         condition: service_started
     healthcheck:
@@ -138,6 +155,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       otel-collector:
         condition: service_started
     healthcheck:

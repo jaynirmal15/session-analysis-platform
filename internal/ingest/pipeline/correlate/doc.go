@@ -19,6 +19,12 @@
 //     the query shape plain PostgreSQL handles worst. That is intentional; the
 //     ceiling is the subject of a later article (ADR-0004).
 //
-// TODO(scope): correlation logic is explicitly out of scope. It depends on the
-// event schema (ADR-0014) and is the piece most damaged by a guessed one.
+// Two of the four problems above are now settled by decision rather than by
+// code. Sessions are not stitched here at all — the join is what this stage
+// produces, and grouping joins into sessions is read-time policy (ADR-0019).
+// And nothing here closes a join by timeout: ended_at is written only from an
+// observed event (ADR-0020).
+//
+// TODO(scope): correlation logic. The schema it writes into exists (ADR-0024);
+// the stage that fills it does not.
 package correlate

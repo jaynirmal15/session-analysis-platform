@@ -17,6 +17,9 @@
 //     identities are caller-supplied and not globally unique across time; the
 //     canonical identity has to be derived, not copied.
 //
-// TODO(scope): translation lands here once the canonical event schema is
-// designed (ADR-0014).
+// The events this adapter accepts, rejects and stores-despite-not-recognising
+// are fixed by ADR-0022.
+//
+// TODO(scope): translation into session.Event. The target schema now exists
+// (ADR-0024); the mapping does not.
 package livekit
