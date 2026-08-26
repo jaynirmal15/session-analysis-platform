@@ -1,0 +1,15 @@
+# Keep the build context to what the Dockerfile actually needs: go.mod, go.sum,
+# cmd/ and internal/.
+.git
+.github
+bin
+dist
+deploy
+docs
+migrations
+*.md
+.env
+.env.local
+.dockerignore
+docker-compose.yml
+Makefile
