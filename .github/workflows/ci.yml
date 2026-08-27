@@ -48,6 +48,44 @@ jobs:
       - name: test
         run: go test -race -count=1 ./...
 
+  integration:
+    name: integration (real postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sap
+          POSTGRES_PASSWORD: sap
+          POSTGRES_DB: sap
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sap -d sap"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The partition-miss classifier distinguishes two errors PostgreSQL
+      # itself produces. A fixture asserting what we believe those errors look
+      # like would test the belief, so these run against a real server.
+      - name: apply migrations
+        run: |
+          docker run --rm --network host \
+            -v "$PWD/migrations:/migrations:ro" \
+            migrate/migrate:v4.19.0 \
+            -path=/migrations \
+            -database "postgres://sap:sap@127.0.0.1:5432/sap?sslmode=disable" up
+
+      - name: integration tests
+        env:
+          SAP_TEST_DATABASE_URL: postgres://sap:sap@127.0.0.1:5432/sap?sslmode=disable
+        run: go test -tags integration -count=1 ./...
+
   compose:
     name: docker compose config
     runs-on: ubuntu-latest

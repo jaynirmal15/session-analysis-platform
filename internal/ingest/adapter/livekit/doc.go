@@ -18,8 +18,16 @@
 //     canonical identity has to be derived, not copied.
 //
 // The events this adapter accepts, rejects and stores-despite-not-recognising
-// are fixed by ADR-0022.
+// are fixed by ADR-0022. Signature verification is in verify.go and uses
+// golang-jwt rather than LiveKit's SDK, for reasons and at a cost recorded in
+// ADR-0026.
 //
-// TODO(scope): translation into session.Event. The target schema now exists
-// (ADR-0024); the mapping does not.
+// One wire-format detail worth knowing before editing the payload struct:
+// LiveKit serialises int64 fields as JSON *strings*, per protobuf's canonical
+// JSON mapping. Declaring them as int64 makes every real delivery fail to
+// decode while every hand-written fixture passes. See protoInt64 in jsonnum.go.
+//
+// TODO(scope): nothing here is exercised against LiveKit versions other than
+// the one in compose. scripts/webhook-smoke.sh is the guard, and it is only
+// worth anything run against a real server rather than a recorded fixture.
 package livekit

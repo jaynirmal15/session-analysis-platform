@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -57,6 +58,72 @@ func LoadService(name, version, defaultListenAddr string) (Service, error) {
 		return Service{}, fmt.Errorf("config: SAP_OTLP_ENDPOINT must not be empty")
 	}
 	return cfg, nil
+}
+
+// Ingester is the write path's configuration: the neutral Service knobs plus
+// what the receiver needs to authenticate deliveries and reach the database.
+//
+// It lives beside Service rather than inside it because the query API needs
+// none of these, and a single struct that knew about both paths would be the
+// first crack in ADR-0009.
+type Ingester struct {
+	Service
+
+	// DatabaseURL is a libpq-style connection string.
+	DatabaseURL string
+
+	// LiveKitAPIKey and LiveKitAPISecret authenticate inbound webhooks. The
+	// secret verifies the delivery signature; it is never logged, and the
+	// receiver refuses to start without it rather than accepting unverified
+	// traffic (ADR-0026).
+	LiveKitAPIKey    string
+	LiveKitAPISecret string
+
+	// MaxBodyBytes caps a single webhook body. A delivery larger than this is
+	// rejected before it is read into memory.
+	MaxBodyBytes int64
+}
+
+// LoadIngester reads the write path's configuration from the environment.
+//
+// It fails rather than defaulting when a credential is missing: a receiver that
+// starts without a verification secret would accept unsigned traffic, which is
+// worse than not starting.
+func LoadIngester(name, version, defaultListenAddr string) (Ingester, error) {
+	svc, err := LoadService(name, version, defaultListenAddr)
+	if err != nil {
+		return Ingester{}, err
+	}
+
+	cfg := Ingester{
+		Service:          svc,
+		DatabaseURL:      env("SAP_DATABASE_URL", "postgres://sap:sap@localhost:5432/sap?sslmode=disable"),
+		LiveKitAPIKey:    env("SAP_LIVEKIT_API_KEY", ""),
+		LiveKitAPISecret: env("SAP_LIVEKIT_API_SECRET", ""),
+		MaxBodyBytes:     intEnv("SAP_MAX_BODY_BYTES", 1<<20),
+	}
+	if cfg.LiveKitAPIKey == "" {
+		return Ingester{}, fmt.Errorf("config: SAP_LIVEKIT_API_KEY is required")
+	}
+	if cfg.LiveKitAPISecret == "" {
+		return Ingester{}, fmt.Errorf("config: SAP_LIVEKIT_API_SECRET is required")
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		return Ingester{}, fmt.Errorf("config: SAP_MAX_BODY_BYTES must be positive")
+	}
+	return cfg, nil
+}
+
+func intEnv(key string, fallback int64) int64 {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 func env(key, fallback string) string {

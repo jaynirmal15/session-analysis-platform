@@ -18,7 +18,17 @@
 // here because it is transport-level; the per-backend detail of how to verify
 // belongs to the adapter.
 //
-// TODO(scope): signature verification, the handler, and the delivery contract
-// are out of scope for the scaffolding commit. See ADR-0011 for why ingest is
-// push-based at all.
+// The receiver acknowledges after one transaction covering both event_raw and
+// participant_join, which amends ADR-0011's original plan of acknowledging on
+// durable receipt and correlating later — ADR-0019 moved the expensive part to
+// read time, and the insert's conflict is what decides whether the join effect
+// runs at all. ADR-0025 records the reversal.
+//
+// Response codes here are instructions to the sender's retry machinery, not
+// status reports; ADR-0027 has the table, including why a missing partition
+// answers 200 and drops the event.
+//
+// TODO(scope): a signal separating an integration break from ordinary bad
+// requests. A malformed rate of 100% from a verified sender is a different
+// event from an occasional bad body, and today they look identical.
 package webhook

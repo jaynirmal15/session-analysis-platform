@@ -1,14 +1,17 @@
-// Command ingester is the write path: it will receive media-backend webhooks,
-// translate them into canonical events, persist them, and correlate them into
-// session timelines.
+// Command ingester is the write path: it receives media-backend webhooks,
+// translates them into canonical events, persists them, and maintains the
+// joins those events open and close.
 //
-// It does none of that yet. This binary currently boots the OpenTelemetry SDK,
-// serves a health endpoint, and exits cleanly on a signal. That is deliberate:
-// it makes the telemetry path (process -> collector -> Prometheus -> Grafana)
-// real and verifiable before any domain code exists to be observed.
+// It acknowledges a delivery after one transaction covering both event_raw and
+// participant_join. That is a change from ADR-0011's original plan of
+// acknowledging on durable receipt and correlating afterwards — ADR-0019 moved
+// session grouping to read time, so the only write-time work left is two
+// indexed statements, and splitting them would cost the atomicity that makes
+// redelivery idempotent. ADR-0025 records the reversal.
 //
-// TODO(scope): register the webhook receiver and start the correlation
-// pipeline once the event schema is designed. See ARCHITECTURE.md ADR-0014.
+// TODO(scope): correlation beyond opening and closing joins, and the mediasoup
+// adapter. No sweeper closes joins by timeout, and none ever should
+// (ADR-0020).
 package main
 
 import (
@@ -22,6 +25,11 @@ import (
 	"time"
 
 	"github.com/jaynirmal15/session-analysis-platform/internal/config"
+	"github.com/jaynirmal15/session-analysis-platform/internal/database"
+	"github.com/jaynirmal15/session-analysis-platform/internal/ingest/adapter/livekit"
+	"github.com/jaynirmal15/session-analysis-platform/internal/ingest/metrics"
+	pgstore "github.com/jaynirmal15/session-analysis-platform/internal/ingest/store/postgres"
+	"github.com/jaynirmal15/session-analysis-platform/internal/ingest/webhook"
 	"github.com/jaynirmal15/session-analysis-platform/internal/telemetry"
 )
 
@@ -50,12 +58,12 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg, err := config.LoadService(serviceName, version, defaultListenAddr)
+	cfg, err := config.LoadIngester(serviceName, version, defaultListenAddr)
 	if err != nil {
 		return err
 	}
 
-	shutdownTelemetry, err := telemetry.Setup(ctx, cfg)
+	shutdownTelemetry, err := telemetry.Setup(ctx, cfg.Service)
 	if err != nil {
 		return err
 	}
@@ -67,14 +75,51 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
+	pool, err := database.Open(ctx, cfg.DatabaseURL, database.IngestOptions())
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	verifier, err := livekit.NewVerifier(cfg.LiveKitAPIKey, cfg.LiveKitAPISecret)
+	if err != nil {
+		return err
+	}
+
+	ingestMetrics, err := metrics.NewIngest()
+	if err != nil {
+		return err
+	}
+
+	handler := webhook.NewLiveKitHandler(
+		verifier, pgstore.New(pool), ingestMetrics, logger, cfg.MaxBodyBytes)
+
 	mux := http.NewServeMux()
+
+	// Liveness only. It deliberately does not check the database: a receiver
+	// that reports itself unhealthy during a database blip would be restarted
+	// by an orchestrator, and restarting cannot fix a database. Storage
+	// failures surface as 5xx on the ingest path, which is where the sender
+	// can act on them.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	// TODO(scope): mount the webhook receiver here.
-	//   mux.Handle("POST /webhook/{backend}", webhook.Handler(...))
+	// Readiness does check the database, because a receiver that cannot write
+	// should not be sent traffic.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := pool.Ping(pingCtx); err != nil {
+			http.Error(w, "database unreachable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ready\n"))
+	})
+
+	mux.Handle("POST /webhook/livekit", handler)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -87,7 +132,7 @@ func run(logger *slog.Logger) error {
 		logger.Info("listening",
 			slog.String("addr", cfg.ListenAddr),
 			slog.String("otlp_endpoint", cfg.OTLPEndpoint),
-			slog.String("note", "scaffolding only: no webhook handlers registered"),
+			slog.String("webhook", "POST /webhook/livekit"),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err

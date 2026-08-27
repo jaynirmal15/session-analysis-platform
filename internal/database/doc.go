@@ -11,9 +11,12 @@
 // the query API wants a larger pool tolerant of long analytical scans against
 // old partitions.
 //
-// TODO(scope): pool construction lands here once there is a query to run. The
-// schema now exists (ADR-0024), but correlation and the query API do not, so
-// there is still nothing to execute — and a driver dependency added before it
-// is used is a dependency chosen without evidence. Migrations are applied by
-// golang-migrate as a container (ADR-0023), which needs no Go driver.
+// The driver is pgx/v5. It arrived with the webhook receiver, which is the
+// first code with a query to run — ADR-0014 held it back until then on the
+// grounds that a driver chosen before it is used is a driver chosen without
+// evidence. Migrations remain golang-migrate as a container (ADR-0023) and do
+// not depend on this package.
+//
+// TODO(scope): read-path options. Only IngestOptions exists, because only the
+// write path has a caller.
 package database

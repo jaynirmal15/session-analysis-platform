@@ -72,6 +72,12 @@ tidy:
 	go mod tidy
 	go mod verify
 
+## test-integration: run tests that need a real PostgreSQL (uses the compose one)
+.PHONY: test-integration
+test-integration:
+	SAP_TEST_DATABASE_URL="postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable" \
+		go test -tags integration -count=1 ./...
+
 ## check: everything CI runs — fmt-check, vet, build, test
 .PHONY: check
 check: fmt-check vet build test
@@ -85,6 +91,7 @@ check: fmt-check vet build test
 POSTGRES_USER     ?= sap
 POSTGRES_PASSWORD ?= sap
 POSTGRES_DB       ?= sap
+POSTGRES_PORT     ?= 5432
 
 # Deferred (=) not immediate (:=), so overriding POSTGRES_* on the command line
 # still reaches the URL.
@@ -181,6 +188,11 @@ run-local-api: infra-up
 	SAP_OTLP_INSECURE=true \
 	SAP_ENVIRONMENT=local-host \
 	go run -ldflags "$(LDFLAGS)" ./cmd/queryapi
+
+## smoke: drive real LiveKit and assert the rows its webhooks produce
+.PHONY: smoke
+smoke:
+	./scripts/webhook-smoke.sh
 
 ## ps: show stack status
 .PHONY: ps

@@ -7,9 +7,9 @@ It ingests lifecycle events from real-time media backends, correlates them into
 per-session timelines, and exposes both aggregate metrics across the fleet and
 drill-down into any individual session.
 
-> **Status: schema, no behaviour.** The repository structure, local development
-> stack, decision log and now the database schema are in place. There is still
-> no business logic — nothing receives a webhook, nothing correlates. See
+> **Status: ingesting.** The receiver takes real LiveKit webhooks, verifies
+> them, stores them idempotently, and opens and closes joins. Sessions are not
+> derived yet and there is no query API. See
 > [Current status](#current-status) for exactly what does and does not work.
 
 ---
@@ -169,7 +169,7 @@ visible in compose output rather than hidden inside application startup. Use
 | Prometheus | http://localhost:9090 | check **Status → Targets**; all should be `UP` |
 | LiveKit | http://localhost:7880 | dev keys, `devkey` / `devsecret…` |
 | OTel Collector | localhost:4317 | OTLP gRPC in; `:8889` metrics out |
-| ingester | http://localhost:8080/healthz | health endpoint only, for now |
+| ingester | http://localhost:8080/webhook/livekit | receiving; `/healthz` and `/readyz` too |
 | queryapi | http://localhost:8081/healthz | health endpoint only, for now |
 | PostgreSQL | localhost:5432 | `sap` / `sap` / `sap`; migrated on startup |
 
@@ -203,6 +203,42 @@ make migrate-version
 ```
 
 It should print `3`. Both tables are empty — nothing writes to them yet.
+
+### Watching it actually ingest
+
+```bash
+make smoke
+```
+
+This joins the local LiveKit with a real client publishing video, then asserts
+the rows its webhooks produced — six event types, one join, opened and closed
+from observed events. It runs the client **inside** the compose network, which
+is why it works on macOS despite the media caveat above.
+
+Expect roughly this:
+
+```
+ room_started       |                   | 00:55:08
+ participant_joined | smoke-participant | 00:55:09
+ track_published    | smoke-participant | 00:55:09
+ participant_left   | smoke-participant | 00:55:13
+ track_unpublished  | smoke-participant | 00:55:13
+ room_finished      |                   | 00:55:33
+
+ smoke-participant | PA_dsfQFoQhMBEw | closed | participant_left | 00:00:04
+```
+
+The join closes with `participant_left` rather than `room_finished` because the
+participant departed before the room was reaped — the more specific observed
+reason wins, and both are recorded distinctly on purpose
+([ADR-0020](ARCHITECTURE.md#adr-0020--ended_at-is-nullable-and-only-ever-set-from-an-observed-event)).
+
+Integration tests against a real PostgreSQL, including the partition-miss
+classifier:
+
+```bash
+make test-integration
+```
 
 ### Reproducing the numbers in the decision log
 
@@ -253,28 +289,34 @@ make help
 
 ## Current status
 
-**Works today:**
+**Works today**, verified against real LiveKit and real PostgreSQL rather than
+against fixtures:
 
-- Full local stack comes up with `docker compose up`, wired end to end,
-  migrations applied.
-- Both binaries boot, serve `/healthz`, and export OpenTelemetry metrics through
-  the collector to Prometheus.
-- Grafana has both datasources provisioned and connected.
+- Full local stack comes up with `docker compose up`, migrations applied.
+- **The LiveKit webhook receiver.** Signature verified before the payload is
+  parsed; unverified deliveries never reach a decoder. Idempotent inserts keyed
+  on a derived event id, so redelivery is discarded and its join effect is not
+  re-applied.
+- **Join maintenance.** `participant_joined` opens, `participant_left` closes,
+  `room_finished` closes everything still open in the room with a distinct
+  reason. `ended_at` is only ever written from an observed event.
 - The schema: two tables, daily partitioning, three purpose-chosen indexes, all
-  reversible. Verified up → down → up against a running PostgreSQL 16.
-- Domain vocabulary in `internal/session`, matching the schema.
-- The decision log, now twenty-four entries.
+  reversible.
+- OpenTelemetry throughout, including counters for the things the platform
+  decided to observe rather than repair — duplicate deliveries, unmatched
+  closes, out-of-order closes, missing partitions.
+- The decision log, now twenty-seven entries.
 
-**Deliberately absent** — each has a `TODO(scope)` marker in the package where
-it will land:
+**Deliberately absent** — each has a `TODO(scope)` marker where it will land:
 
-- Webhook receipt, signature verification and payload handling.
-- The media-backend adapter interface. Not stubbed either: a placeholder
-  interface gets implemented against, and then it is not a placeholder.
-- Correlation logic — the thing that would actually put rows in these tables.
+- Session derivation. Joins are stored; grouping them under a threshold is a
+  read-time concern and there is nothing to read yet
+  ([ADR-0019](ARCHITECTURE.md#adr-0019--the-join-is-the-durable-unit-the-session-is-a-view)).
 - Query API handlers and Grafana dashboards.
-- Store ports and a PostgreSQL driver. There is still no query to run, and a
-  driver chosen before it is used is a driver chosen without evidence.
+- The media-backend adapter interface. Still not stubbed: LiveKit is
+  implemented concretely, and the interface waits for mediasoup to force its
+  shape ([ADR-0003](ARCHITECTURE.md#adr-0003--mediasoup-as-the-deliberate-second-backend)).
+- Any sweeper that closes joins by timeout. There will never be one.
 
 **One live obligation, worth knowing before you run this for real.** Partitions
 must exist ahead of time or inserts fail, there is no `DEFAULT` partition to
@@ -288,7 +330,7 @@ nothing extends it. See [`migrations/README.md`](migrations/README.md).
 
 ```
 cmd/
-  ingester/            write path binary
+  ingester/            write path binary — receiving
   queryapi/            read path binary
 internal/
   config/              process configuration        ─┐
@@ -296,7 +338,9 @@ internal/
   database/            connection construction      ─┘
   session/             canonical domain vocabulary  ── documented exception, ADR-0015
   ingest/              WRITE PATH
+    eventid/           uuidv5 derivation, length-prefixed
     webhook/           receive and authenticate deliveries
+    metrics/           write-path OTel instruments
     adapter/           backend → canonical translation
       livekit/         first backend
       mediasoup/       second backend, deliberately different
@@ -308,6 +352,7 @@ internal/
     store/             read-side persistence port
 migrations/            golang-migrate .sql pairs, up and down
 benchmarks/            reproduces the numbers cited in the ADRs
+scripts/               webhook-smoke.sh — end to end against real LiveKit
 deploy/                compose service configuration
 ```
 
@@ -334,16 +379,14 @@ Canonical event model, partitioned tables, reversible migrations, and the eight
 decisions behind them (ADR-0016 to ADR-0024). Notably: what a session *is*, and
 why it is not a row.
 
-**Phase 2 — Ingest**
-LiveKit webhook receipt with signature verification.
-Durable-receipt-then-acknowledge, because retries are backpressure. Partition
-maintenance, which is now an obligation rather than a plan.
+**Phase 2 — Ingest · done**
+LiveKit webhook receipt with signature verification, idempotent storage, and
+join maintenance. Two problems this phase normally carries were solved by
+decision rather than code: sessions are not stitched at write time (ADR-0019),
+and no sweeper closes joins by timeout (ADR-0020).
 
-**Phase 3 — Correlation**
-Events to joins. The hard parts up front: idempotency under at-least-once
-delivery and out-of-order arrival. Note that two problems normally solved here
-were solved by decision instead — sessions are not stitched at write time
-(ADR-0019), and no sweeper closes joins by timeout (ADR-0020).
+**Phase 3 — Partition maintenance**
+The one live obligation. The bootstrap window is finite and nothing extends it.
 
 **Phase 4 — Query and dashboards**
 Aggregate and drill-down endpoints. The two Grafana dashboards, including the

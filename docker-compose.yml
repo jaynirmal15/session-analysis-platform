@@ -121,6 +121,11 @@ services:
       SAP_OTLP_ENDPOINT: otel-collector:4317
       SAP_OTLP_INSECURE: "true"
       SAP_ENVIRONMENT: ${SAP_ENVIRONMENT:-local}
+      SAP_DATABASE_URL: postgres://${POSTGRES_USER:-sap}:${POSTGRES_PASSWORD:-sap}@postgres:5432/${POSTGRES_DB:-sap}?sslmode=disable
+      # Must match deploy/livekit/livekit.yaml. The receiver refuses to start
+      # without a secret rather than accepting unverified deliveries.
+      SAP_LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      SAP_LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-devsecretdevsecretdevsecretdevsecret}
     ports:
       - "${INGESTER_PORT:-8080}:8080"
     depends_on:
