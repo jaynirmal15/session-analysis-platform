@@ -24,10 +24,6 @@ keys:
 webhook:
   api_key: devkey
   urls:
-    # TODO(scope): this route does not exist yet. The webhook receiver is
-    # unimplemented, so LiveKit will get a 404 for any lifecycle event and
-    # retry. That is expected during scaffolding, and only happens once a
-    # client actually connects to a room.
     - http://ingester:8080/webhook/livekit
 
 logging:

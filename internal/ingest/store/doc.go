@@ -27,7 +27,6 @@
 // active_range column with SQLSTATE 22000, not at the CHECK constraint that
 // appears to guard it. That constraint is unreachable; do not match on it.
 //
-// TODO(scope): the port interface and both counters. The tables now exist
-// (ADR-0024) — event_raw for intake, participant_join for the durable unit —
-// but no persistence code is written yet, so neither counter has an emitter.
+// TODO(scope): the read side of this port. Nothing here reads yet; correlation
+// beyond opening and closing joins is not this package's job (ADR-0019).
 package store

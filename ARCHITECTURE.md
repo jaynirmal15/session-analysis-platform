@@ -47,6 +47,9 @@ Two conventions worth stating up front:
 | [ADR-0022](#adr-0022--livekit-event-ingest-scope-room-lifecycle-stays-raw-only) | LiveKit event ingest scope; room lifecycle stays raw-only | Accepted |
 | [ADR-0023](#adr-0023--golang-migrate-as-the-migration-tool) | golang-migrate as the migration tool | Accepted |
 | [ADR-0024](#adr-0024--the-event-schema) | The event schema (supersedes ADR-0014) | Accepted |
+| [ADR-0025](#adr-0025--the-receiver-acknowledges-after-one-transaction-covering-both-tables) | Receiver acknowledges after one transaction (partially reverses ADR-0011) | Accepted |
+| [ADR-0026](#adr-0026--verify-webhook-signatures-with-golang-jwt-not-the-livekit-sdk) | Verify signatures with golang-jwt, not the LiveKit SDK | Accepted |
+| [ADR-0027](#adr-0027--response-codes-are-a-control-channel-not-a-status-report) | Response codes are a control channel | Accepted |
 
 ---
 
@@ -746,7 +749,8 @@ subsystems (ADR-0009), and a flat root would erase that structure.
 
 ## ADR-0011 — Push-based webhook ingest, not polling
 
-**Status:** Accepted · 2026-08-25
+**Status:** Accepted · 2026-08-25 · *acknowledgement timing amended by
+[ADR-0025](#adr-0025--the-receiver-acknowledges-after-one-transaction-covering-both-tables)*
 
 ### Context
 
@@ -2024,23 +2028,249 @@ See ADR-0004, whose revisit trigger is now stated in terms of this schema's
 reference query rather than generic row counts.
 
 ---
+## ADR-0025 — The receiver acknowledges after one transaction covering both tables
+
+**Status:** Accepted · 2026-08-27 · **Partially reverses [ADR-0011](#adr-0011--push-based-webhook-ingest-not-polling)**
+
+### Context
+
+ADR-0011 committed to acknowledging a delivery on durable receipt and doing
+correlation afterwards, on the reasoning that correlation is "the expensive,
+stateful, failure-prone part" and that coupling the media backend's retry
+behaviour to the cost of a join would turn a downstream stall into duplicate
+inbound traffic.
+
+That reasoning was sound when written. It is no longer load-bearing, because
+ADR-0019 removed the expensive part.
+
+### Decision
+
+The receiver writes `event_raw` and applies the event's effect on
+`participant_join` in **one transaction**, and acknowledges after it commits.
+
+### Why the earlier reasoning no longer applies
+
+Two things changed underneath it:
+
+1. **ADR-0019 moved session grouping to read time.** The expensive, stateful
+   work ADR-0011 was protecting the response path from — stitching joins into
+   sessions under a threshold — no longer happens at write time at all. What
+   remains is an insert and at most one indexed `UPDATE`.
+2. **Idempotency now depends on the two being atomic.** The insert's `ON
+   CONFLICT ... RETURNING` is what decides whether the join effect runs. An
+   empty result means the event is already recorded, so its effect has already
+   been applied and must not be applied again. Reading that decision in one
+   transaction and acting on it in another is a race: two concurrent
+   redeliveries could both observe "inserted" and both open a join.
+
+Splitting them would therefore buy latency we do not need and cost the
+guarantee we do.
+
+### Alternatives considered
+
+**Keep ADR-0011's split: acknowledge on insert, apply join effects
+asynchronously.**
+
+*Rejected* because the atomicity above is the whole idempotency story. Making it
+work across a queue means a durable outbox and a consumer that can tell a
+redelivery from a retry — real machinery, bought to solve a latency problem that
+measurement does not show we have.
+
+**Acknowledge before writing anything, queue the delivery in memory.**
+
+*Rejected outright.* That converts at-least-once delivery into at-most-once at
+the moment the process restarts, which is the one guarantee the backend actually
+gives us and the one we cannot recreate.
+
+### Consequences
+
+- Response time now includes a database round trip. If the database is slow,
+  LiveKit's retries and the slowness compound — the risk ADR-0011 named, now
+  accepted deliberately rather than by omission. It is bounded by a 1s
+  statement timeout on the ingest pool.
+- The write path holds a transaction for the duration of the request, so
+  connection pool exhaustion under burst is a real failure mode to watch.
+- ADR-0011's other consequences — at-least-once, unordered arrival, retries as
+  backpressure — are unaffected and still hold.
+
+### Revisit when
+
+- Ingest latency measurably drives retry volume, i.e. the duration histogram and
+  the duplicate counter start moving together. That is the signal the split was
+  right after all, and the outbox becomes worth its cost.
+
+---
+
+## ADR-0026 — Verify webhook signatures with golang-jwt, not the LiveKit SDK
+
+**Status:** Accepted · 2026-08-27
+
+### Context
+
+LiveKit signs each delivery with a JWT in the `Authorization` header whose
+`sha256` claim is the base64 digest of the request body. Verifying it needs a
+JWT implementation.
+
+### Decision
+
+`github.com/golang-jwt/jwt/v5` for the token, our own body-digest comparison,
+and our own payload structs. HS256 is asserted by the verifier, never read from
+the token.
+
+### Alternatives considered
+
+**LiveKit's own `livekit/protocol/webhook` SDK** — cannot mismatch what LiveKit
+sends, which is a genuine advantage given they have changed the auth header
+format across versions.
+
+*Rejected* because it pulls protobuf and the whole protocol package, and puts
+LiveKit's generated types directly on the ingest path. ADR-0003 exists to stop
+LiveKit's model from becoming the canonical model, and importing their types
+into the receiver is the most direct way to lose that. The cost of this
+rejection was paid immediately and is recorded below.
+
+**Hand-rolled HS256 with `crypto/hmac`** — about sixty lines, zero
+dependencies, fully explicit.
+
+*Rejected* because hand-rolled JWT verification is a well-known source of subtle
+security bugs, and this is a public repository whose code will be copied. The
+attack surface is small and closed, but "small and closed" is what everyone who
+has shipped an alg-confusion bug believed.
+
+### What this decision cost, immediately
+
+Not using LiveKit's SDK means owning the wire format, and the wire format
+surprised us on first contact with a real server.
+
+LiveKit serialises its protobuf messages with the canonical protobuf JSON
+mapping, which encodes `int64` and `uint64` as **JSON strings** — a JSON number
+cannot carry the full 64-bit range without precision loss. Our payload struct
+declared `int64`. Every genuine delivery failed to decode; every unit test
+passed, because the fixtures had been written from documented field shapes
+rather than from a captured delivery.
+
+The receiver is now tolerant of both encodings, and there is a test using the
+real shape. But the general lesson is the one from `benchmarks/README.md` in
+another costume: **a test written from your belief about an external system
+tests your belief.** Only the system can tell you about itself.
+
+### Consequences
+
+- We own compatibility with LiveKit's wire format, and a version bump on their
+  side can break decoding without breaking verification. The smoke test in
+  `scripts/webhook-smoke.sh` is the guard, and it must be run against real
+  LiveKit rather than a recorded fixture to be worth anything.
+- Verification and decoding fail independently, which is useful: the incident
+  above showed authentication working while translation was completely broken.
+
+### Revisit when
+
+- LiveKit changes its auth header format and our verifier has to grow a second
+  path. At that point their SDK's compatibility handling starts to look cheaper
+  than the coupling it brings.
+
+---
+
+## ADR-0027 — Response codes are a control channel, not a status report
+
+**Status:** Accepted · 2026-08-27
+
+### Context
+
+The response to a webhook is not information for a human. It is an instruction
+to the sender's retry machinery: a 2xx means stop, a 5xx means try again. Every
+status the receiver returns should be chosen for the behaviour it provokes.
+
+### Decision
+
+| Situation | Status | Because |
+|---|---|---|
+| Stored, or already stored | 200 | Nothing more to do. |
+| Type out of scope (egress/ingress) | 200 | We will never want it; a retry is pure waste. |
+| Type unrecognised, stored | 200 | Stored successfully. |
+| Signature invalid | 401 | The sender is not who it claims. Retrying will not help. |
+| Body malformed | 400 | Deterministic failure; retrying reproduces it. |
+| Body over the size cap | 413 | Same. |
+| **No partition covers `occurred_at`** | **200** | See below. |
+| Close refused, out of order | 200 | The event *was* stored; only its close was refused. |
+| Any other storage failure | 500 | Genuinely transient. Please retry. |
+
+### The one that is not obvious
+
+**A missing partition returns 200 and drops the event.** This is
+acknowledged data loss, chosen deliberately.
+
+The usual cause is clock skew putting `occurred_at` outside every partition, and
+no number of retries changes that — the event fails identically every time. A
+5xx would convert one lost event into an unbounded retry stream, at exactly the
+moment an operator is dealing with an integration that is already
+misbehaving. Making a bad incident louder in the wrong channel is not
+resilience.
+
+`sap_ingest_partition_missing_total` is the signal. It is deliberately a metric
+and not a status code, because the sender cannot act on this and the operator
+can.
+
+*Rejected alternative:* 500 so the delivery is retried. Defensible when the
+cause is maintenance falling behind rather than skew, since a retry after
+partitions are created would succeed. Rejected because LiveKit's retry window is
+far shorter than the time to notice and fix partition maintenance, so the
+retries would almost always expire unsuccessfully — paying the storm without
+buying the recovery.
+
+*Rejected alternative:* a quarantine table for replay. The most correct answer
+on data preservation, and the right one if this ever becomes frequent. Rejected
+as scope: it is a second table and a replay path, and it should be built when
+the counter says it is needed rather than in anticipation.
+
+### A gap this exposed, recorded rather than fixed
+
+`400 malformed` is currently indistinguishable from an integration break.
+
+When the protobuf-JSON incident (ADR-0026) took the receiver down, **100% of
+authenticated deliveries returned 400** and nothing distinguished that from
+occasional bad requests. A malformed rate near zero and a malformed rate at 100%
+from a verified sender are entirely different events, and only one of them means
+"the integration is broken right now".
+
+TODO(scope): a signal that separates them — plausibly an alert on the ratio of
+malformed to accepted, since the absolute count is meaningless without it. It is
+not a counter this repository is missing; it is a question nobody is asking of
+the counters that exist.
+
+### Consequences
+
+- A sender that never inspects response codes gets no worse behaviour, but a
+  sender that does gets correct instructions.
+- Data loss is possible on the ingest path by design, in exactly one place, and
+  that place is counted.
+
+### Revisit when
+
+- `sap_ingest_partition_missing_total` becomes non-trivial in a real deployment,
+  at which point quarantine-and-replay stops being premature.
+
+---
 ## Open questions
 
 Not yet decisions. Listed so they are not mistaken for oversights.
 
 Four entries left this list on 2026-08-26: session-end semantics became
 ADR-0020, the settling window became ADR-0021, canonical identity became
-ADR-0017, and multi-tenancy became ADR-0018.
+ADR-0017, and multi-tenancy became ADR-0018. The correlation trigger left on
+2026-08-27 — ADR-0025 answered it by putting join maintenance inline.
 
-- **Correlation trigger.** Does the pipeline run on a schedule, on a queue, or
-  incrementally per event? Now unblocked by ADR-0024 and the next thing to
-  decide.
 - **Partition maintenance mechanism.** Partitions must be created ahead of time
   or inserts fail (ADR-0024), and ADR-0023 deliberately keeps this out of the
   migration tool. Whether it is `pg_cron`, a Kubernetes CronJob, or a loop in
-  the ingester is undecided — but it is an obligation now, not a future one.
+  the ingester is undecided. The bootstrap window is finite and nothing extends
+  it, so this is an obligation with a date on it, not a future concern.
+- **Telling an integration break from ordinary bad requests.** A `malformed`
+  rate of 100% from a verified sender means the wire format changed under us; a
+  rate near zero means someone fuzzed the endpoint. Nothing currently
+  distinguishes them, and the first case happened on day one (ADR-0026).
 - **The default reconnect gap.** ADR-0019 makes the threshold a query parameter
-  with a configured default. The default's *value* is a guess nobody has
-  justified yet, and picking it deserves data the platform can now collect.
+  with a configured default. The default's value is still a guess nobody has
+  justified, and the platform can now collect the data to justify it.
 - **Retention policy.** ADR-0004 assumes weeks and ADR-0024's daily partitioning
   is sized for that. The actual number is a product decision still unmade.
