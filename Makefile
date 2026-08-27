@@ -123,6 +123,22 @@ migrate-force:
 psql:
 	docker compose exec postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB)
 
+# --- Benchmarks -------------------------------------------------------------
+#
+# Reproduces the measurements cited in ADR-0004 and ADR-0024.
+# DESTRUCTIVE: truncates and reseeds participant_join.
+
+## bench: run the reference-query benchmark (destroys participant_join data)
+.PHONY: bench
+bench:
+	./benchmarks/run.sh
+
+## bench-verify: sanity-check the currently seeded dataset
+.PHONY: bench-verify
+bench-verify:
+	docker compose exec -T postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) \
+		-f - < benchmarks/verify_seed.sql
+
 # --- Local development ------------------------------------------------------
 
 ## up: build and start the whole stack in containers
