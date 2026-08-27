@@ -204,6 +204,23 @@ make migrate-version
 
 It should print `3`. Both tables are empty — nothing writes to them yet.
 
+### Reproducing the numbers in the decision log
+
+ADR-0004 and ADR-0024 cite measurements. They are reproducible rather than
+asserted:
+
+```bash
+make bench
+```
+
+This seeds synthetic joins and times the reference query across open-join
+fractions. **It truncates `participant_join`** — development databases only;
+`make migrate-reset && make migrate-up` clears up afterwards.
+
+[`benchmarks/README.md`](benchmarks/README.md) has the caveats, and the story of
+how the first version of this benchmark produced a meaningless baseline that
+reached an ADR before anyone noticed.
+
 ### The other local workflow
 
 For iterating on Go code, run the dependencies in containers and the service on
@@ -290,6 +307,7 @@ internal/
     api/               aggregate + drill-down handlers
     store/             read-side persistence port
 migrations/            golang-migrate .sql pairs, up and down
+benchmarks/            reproduces the numbers cited in the ADRs
 deploy/                compose service configuration
 ```
 

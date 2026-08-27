@@ -374,8 +374,9 @@ with a lossy delivery path hits this ceiling five times sooner than a healthy
 one holding the same volume — and the fix there is to repair delivery, not to
 change database.
 
-*Measured anchors, PostgreSQL 16.15, 2-hour window, warm cache, median of five
-to nine runs:* 200k joins @ 5% open = 115 ms · 200k @ 30% = 552 ms · 1M @ 5% =
+*Measured anchors — reproduce with `make bench`, harness and caveats in
+[`benchmarks/`](benchmarks). PostgreSQL 16.15, 2-hour window, warm cache, median
+of five to nine runs:* 200k joins @ 5% open = 115 ms · 200k @ 30% = 552 ms · 1M @ 5% =
 821 ms · 1M @ 10% = 1,216 ms. The projections above extrapolate linearly in
 matched rows from these; they are a fit on synthetic data and should be
 re-derived against real ingest.
@@ -383,7 +384,8 @@ re-derived against real ingest.
 *Superseded baseline:* an earlier version of this trigger cited 66 ms at 200,000
 joins with 5% open. That measurement was taken on degenerate seed data in which
 all 200,000 rows shared one `started_at`, and has been discarded. ADR-0024
-records how it failed.
+records how it failed, and `benchmarks/run.sh` now refuses to produce a number
+under those conditions.
 
 **The drill-down query.** All `event_raw` rows for one
 `(room_name, participant_identity)` within a bounded range stops pruning to a
@@ -1811,7 +1813,9 @@ type removes the opportunity to get it wrong.
 #### Indexes, and what each measurably earns
 
 Measured on PostgreSQL 16.15, 200,000 joins across 4,000 rooms, ~5% open,
-warm cache, median of nine runs.
+warm cache, median of nine runs. Reproduce with `make bench`; the harness is
+[`benchmarks/`](benchmarks) and its caveats are in
+[`benchmarks/README.md`](benchmarks/README.md).
 
 | Index | Serves | Measured |
 |---|---|---|
@@ -1849,6 +1853,14 @@ returned exactly 10,000 rows, precisely the open-join count, with *zero* closed
 joins matching. Every number in the first version of this section, including
 the 66 ms figure and the 39 ms attributed to the sort, was measured against
 degenerate data and has been discarded.
+
+`benchmarks/seed.sql` keeps the broken version in a comment alongside the fix,
+and `run.sh` now refuses to report timings when the seed fails
+`benchmarks/verify_seed.sql` — fewer than 90% distinct `started_at`, or zero
+closed joins matching the window. Both conditions were true of the original run
+and neither was checked. The general lesson, which is about noticing a
+suspiciously round number rather than about `LATERAL`, is in
+[`benchmarks/README.md`](benchmarks/README.md).
 
 **The definitive experiment.** On corrected data (200,000 distinct
 `started_at`), three plans for the same query:
@@ -1922,6 +1934,11 @@ difference being heap locality.
 This model is what makes ADR-0004's revisit trigger expressible as a pair rather
 than a row count. It is a local fit on synthetic data, not a law, and should be
 re-derived once real ingest exists.
+
+Reproduce the whole table with `make bench`, or a single point with
+`ROWS=1000000 FRACTIONS=0.10 make bench`. Run-to-run variance on a laptop is
+appreciable — the shape across fractions is the durable result, not the absolute
+milliseconds.
 
 #### What is canonical, and what stays JSONB
 
