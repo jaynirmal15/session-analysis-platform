@@ -68,6 +68,13 @@ const (
 type Event struct {
 	// ID is derived, never copied from the backend. Deterministic derivation
 	// is what makes at-least-once delivery idempotent (ADR-0011).
+	//
+	// uuidv5 over a length-prefixed join of the backend's own event id where
+	// one exists, and otherwise of (event_type, room, participant identity,
+	// participant SID, track SID, occurred_at to nanoseconds, delivery
+	// ordinal). ADR-0024 specifies the inputs exactly and explains why the
+	// payload is not among them: hashing it both collapses distinct events
+	// and splits redelivered ones.
 	ID string
 
 	Backend        Backend

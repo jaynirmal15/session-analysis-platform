@@ -9,9 +9,21 @@
 -- canonical model.
 
 CREATE TABLE event_raw (
-    -- Derived, never copied: uuidv5 over (backend, backend_event_id), or over
-    -- the canonical tuple for backends that do not supply an event id.
-    -- Deterministic derivation is what makes duplicate delivery idempotent.
+    -- Derived, never copied. Deterministic derivation is what makes duplicate
+    -- delivery idempotent (ADR-0011). Exact inputs are specified in ADR-0024:
+    --
+    --   with a native event id : uuidv5(NS, "v1" | backend | backend_event_id)
+    --   without one            : uuidv5(NS, "v1" | backend | event_type
+    --                                        | room | participant_identity
+    --                                        | participant_sid | track_sid
+    --                                        | occurred_at(ns) | delivery_ordinal)
+    --
+    -- where | is a LENGTH-PREFIXED join, not a delimiter -- otherwise
+    -- ("a","bc") and ("ab","c") derive the same id.
+    --
+    -- track_sid is not optional: without it, audio and video published in the
+    -- same millisecond collapse into one row. The payload is deliberately NOT
+    -- hashed; see ADR-0024 for why that fails in both directions.
     event_id             uuid        NOT NULL,
 
     backend              text        NOT NULL,

@@ -63,6 +63,12 @@ CREATE TABLE participant_join (
         (ended_at IS NULL AND end_reason IS NULL)
         OR (ended_at IS NOT NULL AND end_reason IS NOT NULL)
     ),
+    -- NOTE: this constraint is unreachable in practice. An out-of-order pair
+    -- fails first at the generated active_range column below, with
+    -- SQLSTATE 22000 "range lower bound must be less than or equal to range
+    -- upper bound" -- a different error class, and one carrying no constraint
+    -- name. It is kept because it states the invariant where a reader of the
+    -- schema will see it, but code must not expect it to fire. See ADR-0024.
     CONSTRAINT participant_join_end_after_start CHECK (
         ended_at IS NULL OR ended_at >= started_at
     ),
