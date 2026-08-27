@@ -354,14 +354,36 @@ pathological case for the overlap index.
 range, windowed by `(backend, room_name, participant_identity)` with `lag()`
 computing reconnect gaps and a threshold applied (ADR-0019). Trigger: **p95
 above 2s**, with `EXPLAIN` confirming the GiST overlap index is in use, and
-reported together with **both** the `participant_join` row count **and the
-fraction of joins still open**. A result without the open fraction is not
-interpretable.
+reported as a **(row count, open fraction) pair**. A row count alone is not
+interpretable, because open joins are unbounded ranges (ADR-0020) and dominate
+the result set.
 
-*Baseline for comparison:* 66 ms at 200,000 joins with 5% open, for a 2-hour
-window, on PostgreSQL 16.15. At a 14-day window the planner already prefers a
-parallel sequential scan (83 ms), which is where the overlap index stops
-helping.
+How much that matters, from the measurements in ADR-0024 — the row count at
+which the same 2s trigger fires, projected from the fitted model:
+
+| open fraction | joins at which p95 ≈ 2s |
+|---|---|
+| 1% | ~11M |
+| 5% | ~3.1M |
+| 10% | ~1.65M |
+| 30% | ~570k |
+
+**A 5× swing in the triggering row count between 5% and 30% open**, from one
+variable that has nothing to do with how much data was ingested. A deployment
+with a lossy delivery path hits this ceiling five times sooner than a healthy
+one holding the same volume — and the fix there is to repair delivery, not to
+change database.
+
+*Measured anchors, PostgreSQL 16.15, 2-hour window, warm cache, median of five
+to nine runs:* 200k joins @ 5% open = 115 ms · 200k @ 30% = 552 ms · 1M @ 5% =
+821 ms · 1M @ 10% = 1,216 ms. The projections above extrapolate linearly in
+matched rows from these; they are a fit on synthetic data and should be
+re-derived against real ingest.
+
+*Superseded baseline:* an earlier version of this trigger cited 66 ms at 200,000
+joins with 5% open. That measurement was taken on degenerate seed data in which
+all 200,000 rows shared one `started_at`, and has been discarded. ADR-0024
+records how it failed.
 
 **The drill-down query.** All `event_raw` rows for one
 `(room_name, participant_identity)` within a bounded range stops pruning to a
@@ -1704,11 +1726,64 @@ because one matters more.
 #### Idempotency
 
 On `event_raw`: the primary key `(occurred_at, event_id)`, where `event_id` is
-**derived, never copied** — uuidv5 over `(backend, backend_event_id)`, or over
-the canonical tuple for backends that supply no event id. A duplicate delivery
-derives the same id and conflicts, so the receiver uses `ON CONFLICT DO NOTHING`
-and needs no dedup table. A partitioned table's unique constraints must include
-the partition key, which is why the PK is a pair.
+**derived, never copied**. A duplicate delivery derives the same id and
+conflicts, so the receiver uses `ON CONFLICT DO NOTHING` and needs no dedup
+table. A partitioned table's unique constraints must include the partition key,
+which is why the PK is a pair.
+
+Idempotency is load-bearing for ADR-0011, so the derivation inputs are stated
+exactly rather than left to the implementer.
+
+**Primary path — the backend supplies its own event id.** LiveKit does, as
+`WebhookEvent.id`:
+
+```
+event_id = uuidv5(NAMESPACE_SAP, "v1" ‖ backend ‖ backend_event_id)
+```
+
+The backend guarantees uniqueness; nothing else is needed.
+
+**Fallback path — no native event id.** mediasoup will not have one (ADR-0003):
+
+```
+event_id = uuidv5(NAMESPACE_SAP, "v1" ‖ backend ‖ event_type ‖ room_sid|room_name
+                                ‖ participant_identity ‖ participant_sid
+                                ‖ track_sid ‖ occurred_at(RFC3339, nanoseconds)
+                                ‖ delivery_ordinal)
+```
+
+Four constraints on that construction, each of which is a defect if omitted:
+
+- **`‖` is a length-prefixed join, not a separator.** With a naive delimiter,
+  `("a", "bc")` and `("ab", "c")` produce the same input and therefore the same
+  id. Each field is emitted as its byte length followed by its bytes.
+- **`track_sid` must be included.** Without it, a participant publishing audio
+  and video in the same millisecond produces two `track_published` events
+  differing only in track, which would derive one id and silently collapse into
+  a single row. This is the concrete case the earlier wording — "the canonical
+  tuple" — left open, and it would have been a real data-loss bug.
+- **`delivery_ordinal`** — the event's index within its delivery batch — is the
+  last-resort discriminator for backends that can emit two genuinely distinct
+  events with no distinguishing field at the same instant. It is stable across
+  retries of the same delivery, which is what makes it usable as identity rather
+  than a nonce.
+- **`"v1"` prefixes every input** so the derivation scheme can be changed later
+  without silently re-identifying historical events.
+
+**The payload is deliberately not hashed**, and this is the decision most worth
+recording, because hashing it is the obvious shortcut and it fails in *both*
+directions:
+
+- *Collapse.* Two genuinely distinct events with byte-identical payloads and
+  timestamps become one row. Real data is lost, silently.
+- *Split.* One event redelivered with a payload that differs immaterially —
+  re-serialised JSON with different key order, an added retry counter, a
+  server-side timestamp — derives a **different** id and is stored twice.
+  Idempotency fails open, which defeats the entire purpose of deriving the id.
+
+The second failure is the worse one and the harder to notice, because nothing
+errors: the table just accumulates duplicates that every downstream count
+believes are real.
 
 On `participant_join`: a unique constraint on `started_event_id`.
 
@@ -1735,32 +1810,118 @@ type removes the opportunity to get it wrong.
 
 #### Indexes, and what each measurably earns
 
-Measured on 200,000 joins across 4,000 rooms with 5% left open (78 MB),
-PostgreSQL 16.15:
+Measured on PostgreSQL 16.15, 200,000 joins across 4,000 rooms, ~5% open,
+warm cache, median of nine runs.
 
 | Index | Serves | Measured |
 |---|---|---|
-| `participant_join_active_range_idx` (GiST) | overlap filter in the reference query | bitmap index scan; 10,000 rows from a 2-hour window; 66 ms total |
+| `participant_join_active_range_idx` (GiST) | overlap filter in the reference query | bitmap index scan; 11,538 rows from a 2-hour window; 115 ms total |
 | `participant_join_window_idx` (btree) | per-`(room, identity)` drill-down | index scan, 0.22 ms |
 | `participant_join_open_idx` (partial btree) | the open-and-stale panel (ADR-0020) | index-only scan, 0 heap fetches, 2.0 ms for 10,000 open joins |
 | `event_raw_pkey` | partition pruning; idempotent insert | — |
 | `event_raw_participant_idx` | per-session drill-down into raw events | — |
 
-**One correction, recorded because the reasoning was wrong before it was
-measured.** `participant_join_window_idx` was chosen expecting it to supply the
-reference query's window frame in index order and thereby avoid a sort. It does
-not. The overlap predicate drives the plan, producing a bitmap heap scan, after
-which index order is gone and PostgreSQL sorts — 39 ms of the 66 ms. The index
-is kept because it decisively serves a *different* real query (per-`(room,
-identity)` drill-down, 0.22 ms), but the original justification was wrong and
-the sort remains in the plan.
-
-At a 14-day window the planner correctly abandons the GiST index for a parallel
-sequential scan (83 ms). That is the right choice at that selectivity, and it
-marks where the overlap index stops helping.
-
 `event_raw` gets only two indexes: it is the append path ADR-0011 requires to
 stay fast, and every index is paid on every insert.
+
+#### Measurement history for `participant_join_window_idx`
+
+This index's justification was wrong twice before it was right. The history is
+kept in full because an ADR that shows a justification failing is worth more
+than one that looks clean.
+
+**The original claim (2026-08-26).** The index was chosen on the reasoning that
+it would supply the reference query's `PARTITION BY (backend, room_name,
+participant_identity) ORDER BY started_at` in index order, so the `lag()` that
+computes reconnect gaps would need no sort.
+
+**First refutation, same day.** `EXPLAIN ANALYZE` showed an explicit `Sort` node
+in the plan. The claim was recorded as refuted and the index re-justified on
+drill-down alone. That correction was directionally right but incomplete: it
+asserted the sort was unavoidable without testing whether it was.
+
+**The measurement itself was then invalidated.** The seed data used
+`LATERAL (SELECT now() - random() * 14 * interval '1 day')` with no correlation
+to the generated row, so PostgreSQL evaluated it **once**: all 200,000 rows
+shared a single identical `started_at` (`count(DISTINCT started_at) = 1`). The
+tell was visible in the original plan and went unexamined — the 2-hour window
+returned exactly 10,000 rows, precisely the open-join count, with *zero* closed
+joins matching. Every number in the first version of this section, including
+the 66 ms figure and the 39 ms attributed to the sort, was measured against
+degenerate data and has been discarded.
+
+**The definitive experiment.** On corrected data (200,000 distinct
+`started_at`), three plans for the same query:
+
+| | Access path | Sort? | Execution |
+|---|---|---|---|
+| A — default | GiST bitmap index scan | **yes** | 96 ms |
+| B — GiST dropped | parallel sequential scan | **yes** | 107 ms |
+| C — GiST dropped, `enable_seqscan = off` | `Parallel Index Scan using participant_join_window_idx` | **no Sort node** | 112 ms |
+
+**The corrected reasoning.** The sort is *not* inherent to the query shape. Test
+C shows the btree can supply the ordering — the `Sort` disappears entirely,
+replaced by a `Gather Merge` over index-ordered streams. The planner declines
+that path because scanning 200,000 index entries and filtering down to ~11,500
+costs more than bitmap-scanning 11,500 and sorting them, and the planner is
+right by about 16%.
+
+The two access paths are mutually exclusive **because they are indexes on
+different columns**: selective filtering (GiST on `active_range`) or free
+ordering (btree on the window key), never both. Choosing the selective path
+means accepting the sort. That is a cost trade-off the planner re-evaluates per
+query, not a missing index.
+
+So `participant_join_window_idx` earns its place on per-`(room, identity)`
+drill-down (0.22 ms, and nothing else serves it), **not** on the reference
+query. The sort in the reference query is the accepted price of the selective
+path, and it should stop being treated as a defect to engineer away.
+
+#### How the reference query scales with the open-join fraction
+
+Open joins are `[started_at, ∞)` and therefore overlap **every** later window.
+A row count alone does not describe this workload; the open fraction does most
+of the work. Measured on PostgreSQL 16.15, 2-hour window, warm cache, median of
+nine runs, row count held constant at 200,000:
+
+| open % | matched | of which open | of which closed | median | min–max |
+|---|---|---|---|---|---|
+| 1% | 3,447 | 1,981 | 1,466 | 43 ms | 31–148 |
+| 5% | 11,538 | 10,116 | 1,422 | 115 ms | 98–212 |
+| 10% | 21,402 | 20,079 | 1,323 | 202 ms | 165–378 |
+| 30% | 60,712 | 59,661 | 1,051 | 552 ms | 503–696 |
+
+The plan shape is identical at every fraction — GiST bitmap index scan
+throughout. Nothing degrades qualitatively; the result set simply grows.
+
+**The closed-row count barely moves** — roughly 1,000 to 1,500 across the whole
+range, because that is the population genuinely active in a 2-hour window. Every
+additional matched row comes from the open population. At 30% open, 98% of the
+result set is open joins, which is to say 98% of the query's cost is being spent
+on joins whose ends were never observed.
+
+Two larger data points, at 1,000,000 joins:
+
+| rows | open % | matched | median |
+|---|---|---|---|
+| 1M | 5% | 56,962 | 821 ms |
+| 1M | 10% | 106,411 | 1,216 ms |
+
+**The model.** Matched rows are predicted to within 8% across all six
+measurements by
+
+```
+matched ≈ total_rows × (open_fraction + window_span / data_span)
+```
+
+where the second term is the fraction of closed joins the window catches — here
+2 hours over 14 days, about 0.6%. Execution time is close to linear in matched
+rows, at roughly 10 µs per row at 200,000 and 12–14 µs at 1,000,000, the
+difference being heap locality.
+
+This model is what makes ADR-0004's revisit trigger expressible as a pair rather
+than a row count. It is a local fit on synthetic data, not a law, and should be
+re-derived once real ingest exists.
 
 #### What is canonical, and what stays JSONB
 
@@ -1775,6 +1936,58 @@ LiveKit's model the canonical model — the failure ADR-0014 named explicitly.
 The boundary rule: **a field becomes a column when a query filters or joins on
 it, not when it looks important.** Promoting a field later is an additive
 migration; demoting one is not.
+
+#### Two error shapes the receiver must handle, with their exact signatures
+
+Both were captured against the running database rather than assumed, because
+both are easy to get wrong in ways that only show up in production.
+
+**A missing partition is a signal, not a crash.** `occurred_at` is the backend's
+clock and there is no `DEFAULT` partition, so a late or clock-skewed event whose
+target partition does not exist raises:
+
+```
+SQLSTATE 23514: no partition of relation "event_raw" found for row
+DETAIL: Partition key of the failing row contains (occurred_at) = (...)
+```
+
+That failure is the behaviour this ADR chose deliberately. It must be **counted
+and surfaced, not merely thrown**, or a clock-skewed integrator arrives as a
+crash loop instead of as a number on a dashboard.
+
+**SQLSTATE 23514 alone is not a sufficient test.** An ordinary CHECK constraint
+violation uses the same code. The two are distinguished by whether the error
+carries a constraint name — a CHECK violation populates it, a partition miss
+leaves it empty:
+
+```
+partition miss    → SQLSTATE 23514, constraint name empty
+CHECK violation   → SQLSTATE 23514, constraint name set (e.g. participant_join_end_together)
+```
+
+The metric is `sap_ingest_partition_missing_total`, labelled by backend, and it
+belongs on the same dashboard as the stale-open-join panel from ADR-0020. Both
+measure the same thing from different angles: the gap between what the backend
+believes it sent and what we were able to record.
+
+TODO(scope): the counter has no emitter yet, because nothing inserts. The
+detection predicate above is the contract; it is recorded here and in
+`internal/ingest/store` so the receiver implements it correctly rather than
+rediscovering it.
+
+**`participant_join_end_after_start` never fires.** Inserting `ended_at <
+started_at` fails first at the generated `active_range` column, with a different
+error class entirely:
+
+```
+SQLSTATE 22000: range lower bound must be less than or equal to range upper bound
+```
+
+The CHECK is kept — it states the invariant explicitly in the DDL, where someone
+reading the schema will see it — but it is unreachable in practice, and the
+receiver must handle the opaque 22000 range error rather than expecting a named
+constraint violation. Recorded because a constraint that cannot fire looks like
+protection and is not.
 
 ### Consequences
 
