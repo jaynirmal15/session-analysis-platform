@@ -53,7 +53,7 @@ func NewIngest() (*Ingest, error) {
 	}
 
 	i.requests = c("sap_ingest_webhook_requests_total",
-		"Webhook deliveries received, by outcome.", "{request}")
+		"Webhook deliveries received, by outcome and by whether the sender's signature verified. outcome=malformed with verified=true means the wire format changed under us; with verified=false it is unauthenticated noise.", "{request}")
 	i.stored = c("sap_ingest_events_stored_total",
 		"Events durably written to event_raw.", "{event}")
 	i.duplicates = c("sap_ingest_events_duplicate_total",
@@ -88,10 +88,31 @@ func backendAttr(backend string) metric.MeasurementOption {
 	return metric.WithAttributes(attribute.String("backend", backend))
 }
 
-func (i *Ingest) Request(ctx context.Context, backend, outcome string, seconds float64) {
+// Request records a delivery's outcome.
+//
+// The `verified` label is what separates two failures that share the outcome
+// "malformed" and mean opposite things:
+//
+//   - verified=false — an unauthenticated sender sent something unreadable.
+//     Background noise; the internet is full of it.
+//   - verified=true — a sender holding our shared secret sent a body we could
+//     not decode. That is not noise. It means the wire format changed under us,
+//     and it is the failure that ran unnoticed for an entire session when
+//     LiveKit's protobuf-JSON encoding turned out to differ from what our
+//     fixtures assumed (ADR-0026, ADR-0028).
+//
+// The question worth alerting on is a ratio, not a count, because the absolute
+// number is meaningless without knowing how much traffic there was:
+//
+//	sum(rate(sap_ingest_webhook_requests_total{outcome="malformed",verified="true"}[5m]))
+//	  / sum(rate(sap_ingest_webhook_requests_total{verified="true"}[5m]))
+//
+// Near zero is healthy. Near one means the integration is broken right now.
+func (i *Ingest) Request(ctx context.Context, backend, outcome string, verified bool, seconds float64) {
 	i.requests.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("backend", backend),
 		attribute.String("outcome", outcome),
+		attribute.Bool("verified", verified),
 	))
 	i.duration.Record(ctx, seconds, backendAttr(backend))
 }
