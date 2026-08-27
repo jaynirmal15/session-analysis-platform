@@ -58,6 +58,15 @@ distribution to catch, because there was only one timestamp.
 **A benchmark result that is suspiciously round, or that exactly equals another
 quantity in the system, is a defect report until proven otherwise.**
 
+This is one instance of a more general principle, which this repository arrived
+at the hard way three separate times: **an artifact that stands in for reality
+must be checked against that reality at least once, and that check must be part
+of the artifact.** A seed stands in for production data; a fixture stands in for
+an external system; a check target stands in for CI. All three failed here, and
+all three reported success while doing it. See
+[ADR-0028](../ARCHITECTURE.md#adr-0028--verification-artifacts-must-themselves-be-verified)
+for the other two incidents and what each one cost.
+
 Round numbers are what constants look like. Randomised processes produce untidy
 ones. When a measurement of a random population comes back tidy, something has
 collapsed a distribution somewhere — and the most likely candidate is the

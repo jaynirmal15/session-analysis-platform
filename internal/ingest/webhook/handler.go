@@ -52,12 +52,20 @@ func (h *LiveKitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer span.End()
 
 	backend := string(livekit.Backend)
+
+	// Whether this delivery's signature verified, which is what makes an
+	// undecodable body interpretable. A malformed body from an unauthenticated
+	// sender is noise; the same body from a sender holding our secret means the
+	// wire format changed under us. See ADR-0028.
+	verified := false
+
 	finish := func(status int, outcome string) {
 		span.SetAttributes(
 			attribute.String("sap.outcome", outcome),
+			attribute.Bool("sap.verified", verified),
 			attribute.Int("http.response.status_code", status),
 		)
-		h.metrics.Request(ctx, backend, outcome, time.Since(start).Seconds())
+		h.metrics.Request(ctx, backend, outcome, verified, time.Since(start).Seconds())
 		w.WriteHeader(status)
 	}
 
@@ -86,13 +94,19 @@ func (h *LiveKitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		finish(http.StatusUnauthorized, outcomeUnverified)
 		return
 	}
+	verified = true
 
 	// LiveKit sends one event per request, so the delivery ordinal is zero. It
 	// is passed explicitly rather than assumed, because a batching backend
 	// would need it and retrofitting it later would change every derived id.
 	ev, disposition, err := livekit.Translate(body, 0)
 	if err != nil {
-		h.log.WarnContext(ctx, "malformed delivery", slog.Any("error", err))
+		// Logged at error, not warn: the signature already verified, so this is
+		// a sender holding our secret sending a body we cannot read. That is an
+		// integration break, not a bad request.
+		h.log.ErrorContext(ctx, "verified sender, undecodable body",
+			slog.String("backend", backend),
+			slog.Any("error", err))
 		finish(http.StatusBadRequest, outcomeMalformed)
 		return
 	}

@@ -208,3 +208,56 @@ func TestDuplicateIsAcknowledged(t *testing.T) {
 		t.Fatalf("status = %d, want 200", res.Code)
 	}
 }
+
+// The two failures that share outcome="malformed" and mean opposite things.
+//
+// This is the gap ADR-0027 recorded and ADR-0028 explains: for an entire
+// session, a receiver that rejected 100% of genuine LiveKit deliveries produced
+// the same signal as an endpoint being idly fuzzed. The distinguishing fact is
+// whether the sender held our secret.
+func TestMalformedIsSeparableByVerification(t *testing.T) {
+	// Verified sender, undecodable body: the wire format changed under us.
+	t.Run("verified sender", func(t *testing.T) {
+		body := `{"id":"EV_1","createdAt":"1787000000"}` // valid JSON, no event type
+		f := &fakeWriter{}
+		res := post(t, newHandler(t, f), body, signed(t, body))
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", res.Code)
+		}
+		if len(f.got) != 0 {
+			t.Error("an undecodable body reached the store")
+		}
+	})
+
+	// Unauthenticated sender: noise, and it must never be confused with the above.
+	t.Run("unverified sender", func(t *testing.T) {
+		f := &fakeWriter{}
+		res := post(t, newHandler(t, f), `{"garbage`, "")
+		if res.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401 — verification precedes parsing", res.Code)
+		}
+		if len(f.got) != 0 {
+			t.Error("unverified body reached the store")
+		}
+	})
+}
+
+// The regression guard for the bug that started all this. A verified delivery
+// in LiveKit's real wire format — int64 fields encoded as JSON strings — must
+// be accepted. If this ever fails, the receiver is rejecting genuine traffic
+// again and the malformed/verified=true ratio is the thing that will say so.
+func TestRealWireFormatIsAccepted(t *testing.T) {
+	body := `{"event":"participant_joined","id":"EV_real","createdAt":"1787791385",` +
+		`"room":{"sid":"RM_1","name":"standup","creationTime":"1787791380"},` +
+		`"participant":{"sid":"PA_1","identity":"alice","joinedAt":"1787791385"}}`
+
+	f := &fakeWriter{result: store.Result{Stored: true, JoinOpened: true}}
+	res := post(t, newHandler(t, f), body, signed(t, body))
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — this is the shape LiveKit actually sends", res.Code)
+	}
+	if len(f.got) != 1 {
+		t.Fatal("a genuine delivery did not reach the store")
+	}
+}

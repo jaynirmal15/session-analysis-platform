@@ -50,6 +50,7 @@ Two conventions worth stating up front:
 | [ADR-0025](#adr-0025--the-receiver-acknowledges-after-one-transaction-covering-both-tables) | Receiver acknowledges after one transaction (partially reverses ADR-0011) | Accepted |
 | [ADR-0026](#adr-0026--verify-webhook-signatures-with-golang-jwt-not-the-livekit-sdk) | Verify signatures with golang-jwt, not the LiveKit SDK | Accepted |
 | [ADR-0027](#adr-0027--response-codes-are-a-control-channel-not-a-status-report) | Response codes are a control channel | Accepted |
+| [ADR-0028](#adr-0028--verification-artifacts-must-themselves-be-verified) | Verification artifacts must themselves be verified | Accepted |
 
 ---
 
@@ -1862,9 +1863,15 @@ degenerate data and has been discarded.
 and `run.sh` now refuses to report timings when the seed fails
 `benchmarks/verify_seed.sql` — fewer than 90% distinct `started_at`, or zero
 closed joins matching the window. Both conditions were true of the original run
-and neither was checked. The general lesson, which is about noticing a
-suspiciously round number rather than about `LATERAL`, is in
-[`benchmarks/README.md`](benchmarks/README.md).
+and neither was checked.
+
+The lesson is not about `LATERAL`. This is incident 1 of three with the same
+shape, recorded together in
+[ADR-0028](#adr-0028--verification-artifacts-must-themselves-be-verified): a
+verification artifact that was never itself verified against the thing it stood
+in for, and that reported success while doing it.
+[`benchmarks/README.md`](benchmarks/README.md) has the detection heuristic for
+this one.
 
 **The definitive experiment.** On corrected data (200,000 distinct
 `started_at`), three plans for the same query:
@@ -2150,9 +2157,18 @@ passed, because the fixtures had been written from documented field shapes
 rather than from a captured delivery.
 
 The receiver is now tolerant of both encodings, and there is a test using the
-real shape. But the general lesson is the one from `benchmarks/README.md` in
-another costume: **a test written from your belief about an external system
-tests your belief.** Only the system can tell you about itself.
+real shape.
+
+The general lesson is not specific to LiveKit or to protobuf: **a test written
+from your belief about an external system tests your belief.** Fixtures and the
+code under test were written by the same person from the same mental model, so
+they agreed with each other and with nothing else. Only the system can tell you
+about itself.
+
+This is incident 2 of three sharing that shape, recorded together in
+[ADR-0028](#adr-0028--verification-artifacts-must-themselves-be-verified), along
+with the heuristic it produces: fixtures for an external system's wire format
+must be captured from that system, not written from its documentation.
 
 ### Consequences
 
@@ -2223,20 +2239,40 @@ on data preservation, and the right one if this ever becomes frequent. Rejected
 as scope: it is a second table and a replay path, and it should be built when
 the counter says it is needed rather than in anticipation.
 
-### A gap this exposed, recorded rather than fixed
+### A gap this exposed, since closed
 
-`400 malformed` is currently indistinguishable from an integration break.
+`400 malformed` was indistinguishable from an integration break.
 
 When the protobuf-JSON incident (ADR-0026) took the receiver down, **100% of
-authenticated deliveries returned 400** and nothing distinguished that from
-occasional bad requests. A malformed rate near zero and a malformed rate at 100%
-from a verified sender are entirely different events, and only one of them means
-"the integration is broken right now".
+authenticated deliveries returned 400**, and nothing separated that from an
+endpoint being idly fuzzed. A malformed rate near zero and a malformed rate at
+100% from a verified sender are entirely different events, and only one of them
+means "the integration is broken right now".
 
-TODO(scope): a signal that separates them — plausibly an alert on the ratio of
-malformed to accepted, since the absolute count is meaningless without it. It is
-not a counter this repository is missing; it is a question nobody is asking of
-the counters that exist.
+**Closed 2026-08-27.** `sap_ingest_webhook_requests_total` now carries a
+`verified` label, so the two are different series:
+
+| | Meaning |
+|---|---|
+| `outcome="malformed", verified="false"` | an unauthenticated sender sent something unreadable — noise |
+| `outcome="malformed", verified="true"` | a sender holding our secret sent a body we cannot decode — the wire format changed under us |
+
+The alertable quantity is a ratio, because the absolute count says nothing
+without knowing the traffic volume:
+
+```promql
+sum(rate(sap_ingest_webhook_requests_total{outcome="malformed",verified="true"}[5m]))
+  / sum(rate(sap_ingest_webhook_requests_total{verified="true"}[5m]))
+```
+
+Near zero is healthy; near one is an outage in progress. The post-verification
+decode failure is also logged at error rather than warn, because a sender
+holding our secret is not making a bad request — it is telling us our reader is
+wrong.
+
+This mattered enough to do before mediasoup, since a second backend doubles the
+surface for exactly this failure while halving the chance of noticing which one
+broke.
 
 ### Consequences
 
@@ -2251,24 +2287,228 @@ the counters that exist.
   at which point quarantine-and-replay stops being premature.
 
 ---
+## ADR-0028 — Verification artifacts must themselves be verified
+
+**Status:** Accepted · 2026-08-27
+
+### Context
+
+Three failures in this repository's first week share a shape. None of them is
+interesting alone; together they describe a specific way this project is
+likely to be wrong again, which is what makes them worth an entry.
+
+In each case an artifact stood in for reality — a seed standing in for
+production data, fixtures standing in for an external system, a make target
+standing in for CI — and in each case **that artifact reported success while the
+thing it represented was broken.** The artifact was never checked against what
+it claimed to represent.
+
+The pattern is worse than an ordinary bug, because the verification machinery
+inverts. A test suite that fails tells you something is wrong. A test suite that
+passes for the wrong reason tells you something is *right*, and you act on it.
+In incident 2 below, twenty passing tests actively concealed a receiver that
+worked for nobody.
+
+---
+
+### Incident 1 — the seed that produced one timestamp
+
+**What the artifact claimed.** `benchmarks/seed.sql` claimed to generate 200,000
+joins spread randomly over 14 days, so the reference query could be measured
+against a realistic time distribution.
+
+**What it actually did.** The seed used:
+
+```sql
+FROM generate_series(1, 200000) AS i,
+LATERAL (SELECT now() - (random() * 14) * interval '1 day' AS st) AS s
+```
+
+The `LATERAL` subquery never references `i`, so it is not correlated with the
+outer relation and PostgreSQL is free to evaluate it **once**. It did. All
+200,000 rows received an identical `started_at`. `count(DISTINCT started_at)`
+was 1.
+
+**What was measured instead.** GiST behaviour over 200,000 identical ranges — a
+workload this platform will never have. The number, 66 ms, became the baseline
+in ADR-0004's revisit trigger and the index justification in ADR-0024.
+
+**The tell.** The plan output reported exactly **10,000** matched rows for a
+2-hour window. The open-join count, seeded as `i % 20 = 0` over 200,000 rows,
+was also exactly **10,000**. Zero closed joins matched.
+
+**Why it was missed.** The number looked like success. An index scan returning a
+tidy figure reads as the index working, and nobody asked the second question:
+why is a process driven by `random()` producing a round number, and why does it
+equal a quantity we already know? Working it through takes under a minute — 
+200,000 joins over 14 days should put ~1,190 closed joins in a 2-hour window,
+and the observed zero would have been impossible to explain.
+
+**Cost.** Two ADRs carried an invalid measurement for a full commit.
+
+---
+
+### Incident 2 — fixtures written from documentation
+
+**What the artifact claimed.** The LiveKit adapter's unit tests claimed to
+verify that genuine LiveKit webhook deliveries are correctly translated into
+canonical events.
+
+**What it actually did.** The fixtures were hand-written from LiveKit's
+documented field shapes, using JSON numbers for `int64` fields:
+
+```json
+{"event":"participant_joined","createdAt":1787000000}
+```
+
+LiveKit serialises its protobuf messages with the canonical protobuf JSON
+mapping, which encodes `int64` and `uint64` as **strings**, because a JSON
+number cannot carry the full 64-bit range without precision loss:
+
+```json
+{"event":"participant_joined","createdAt":"1787000000"}
+```
+
+The payload struct declared `int64`. Every genuine delivery failed to decode.
+
+**The tell.** There was none in the test suite, and that is the point. The tell
+existed only in the ingester's logs, once it was pointed at a real LiveKit:
+`cannot unmarshal string into Go struct field payload.createdAt of type int64`,
+on every single delivery.
+
+**Why it was missed.** The fixtures and the code under test were written by the
+same person from the same mental model. A fixture is not an independent
+observation — it is the author's belief about the external system, and testing
+code against it tests self-consistency. Twenty-odd tests passed while the
+receiver rejected **100%** of real traffic.
+
+**Cost.** Caught only because the task specified verifying against real LiveKit
+rather than synthetic payloads. Without that constraint it would have shipped,
+and the first sign would have been an empty database.
+
+---
+
+### Incident 3 — a check target that lied about CI
+
+**What the artifact claimed.** `make check` described itself in its own help
+text as "everything CI runs", so that a green local run predicted a green CI
+run.
+
+**What it actually did.** It ran `fmt-check`, `vet`, `build` and `test`. CI also
+ran a `go mod tidy is clean` step. The target had never been compared against
+the workflow it claimed to mirror.
+
+**The tell.** None locally — by construction. The gap was only observable by
+reading two files side by side and noticing one had a step the other did not.
+
+**Why it was missed.** The claim was made in a help string, which is
+documentation, and documentation is not executed. Nothing anywhere asserted the
+parity the target advertised.
+
+**Cost.** One failed CI run. Trivial in itself — and the reason it is recorded
+is that the failure mode is not trivial: a check target that can pass while CI
+fails trains people to stop reading it, and then it stops catching anything.
+
+---
+
+### Decision
+
+**An artifact that stands in for reality must be checked against that reality at
+least once, and that check must be part of the artifact — not an act of
+diligence someone performed while writing it.**
+
+Standing in for reality covers seeds, fixtures, mocks, stubs, synthetic
+payloads, check targets, recorded responses, and any documentation that makes a
+falsifiable claim about a system.
+
+Two clauses, both load-bearing:
+
+**"At least once against reality."** Not "tested". A seed can be tested. The
+question is whether anything ever compared it to the distribution it claims to
+produce. A fixture can be tested. The question is whether the bytes in it were
+ever emitted by the system they represent.
+
+**"Part of the artifact."** A check performed once during authoring decays
+silently, because the reality drifts and the artifact does not. The check has to
+live where it will run again: a gate in the harness, a test in the suite, a CI
+job.
+
+This is deliberately not "write integration tests". Integration tests are one
+instance. Incident 3 had no integration to test, and incident 1's fix is a
+`count(DISTINCT)` assertion inside a benchmark runner. The principle is about
+the epistemic status of the artifact, not about which layer of the test pyramid
+it sits in.
+
+### Detection heuristics
+
+Three specific, cheap checks these incidents produce:
+
+**A benchmark result that is suspiciously round, or that exactly equals another
+quantity in the system, is a defect report until proven otherwise.** Round
+numbers are what constants look like; randomised processes produce untidy ones.
+When a measurement over a random population comes back tidy, a distribution has
+collapsed somewhere, and the harness is a likelier suspect than the system under
+test.
+
+**Fixtures for an external system's wire format must be captured from that
+system, not written from its documentation.** Documentation describes intent;
+the wire carries the reality, and they differ in exactly the places that hurt —
+encodings, optionality, field presence. A hand-written fixture encodes the
+author's reading, so the test proves the author is self-consistent.
+
+**A check target claiming parity with CI must be tested for that parity, in both
+directions.** Both, because the failure is symmetric: a target missing a CI step
+gives false confidence, and a target with a step CI lacks blocks work for no
+reason. Test that the guard rejects a bad input as well as accepting a good one
+— a guard that has never fired is a guard nobody knows is wired up.
+
+### Consequences
+
+- More machinery in places that feel like they should be simple. `run.sh` now
+  refuses to report timings if its own seed fails a sanity check; `make check`
+  now shells out to compare itself with CI's expectations. Both are ugly, and
+  both are cheaper than what they prevent.
+- Some artifacts cannot be checked cheaply against reality, and for those the
+  honest move is to record the gap rather than to pretend. The mediasoup
+  adapter will be in this position before there is a mediasoup to check against.
+- This entry will look obvious in hindsight. It was not obvious in any of the
+  three moments it mattered, which is the argument for writing it down while the
+  detail is recoverable.
+
+### Applied here
+
+| Incident | The check that now exists |
+|---|---|
+| 1 | `benchmarks/verify_seed.sql`, and `run.sh` aborts before timing if under 90% of `started_at` are distinct or the window matches zero closed joins. Verified by running the harness against the original broken seed. |
+| 2 | A test using the real string-encoded wire format, plus `scripts/webhook-smoke.sh` driving a real LiveKit end to end. |
+| 3 | `make tidy-check`, included in `make check`. Verified in both directions — it rejects a deliberately untidied `go.mod` and accepts the tidy one. |
+
+The receiver also now labels its request metric by whether the sender's
+signature verified, so incident 2's failure mode is visible while it is
+happening rather than a session later. See ADR-0027.
+
+### Revisit when
+
+- A fourth incident of this shape appears despite the heuristics above. That
+  would mean the heuristics are too specific to the three cases that produced
+  them, and the entry needs a more general detector rather than a longer list.
+
+---
 ## Open questions
 
 Not yet decisions. Listed so they are not mistaken for oversights.
 
-Four entries left this list on 2026-08-26: session-end semantics became
-ADR-0020, the settling window became ADR-0021, canonical identity became
-ADR-0017, and multi-tenancy became ADR-0018. The correlation trigger left on
-2026-08-27 — ADR-0025 answered it by putting join maintenance inline.
+Entries leave this list when they become decisions. Session-end semantics became
+ADR-0020, the settling window ADR-0021, canonical identity ADR-0017,
+multi-tenancy ADR-0018, the correlation trigger ADR-0025, and telling an
+integration break from ordinary bad requests was closed by the `verified` label
+described in ADR-0027.
 
 - **Partition maintenance mechanism.** Partitions must be created ahead of time
   or inserts fail (ADR-0024), and ADR-0023 deliberately keeps this out of the
   migration tool. Whether it is `pg_cron`, a Kubernetes CronJob, or a loop in
   the ingester is undecided. The bootstrap window is finite and nothing extends
-  it, so this is an obligation with a date on it, not a future concern.
-- **Telling an integration break from ordinary bad requests.** A `malformed`
-  rate of 100% from a verified sender means the wire format changed under us; a
-  rate near zero means someone fuzzed the endpoint. Nothing currently
-  distinguishes them, and the first case happened on day one (ADR-0026).
+  it, so this is an obligation with a date on it rather than a future concern.
 - **The default reconnect gap.** ADR-0019 makes the threshold a query parameter
   with a configured default. The default's value is still a guess nobody has
   justified, and the platform can now collect the data to justify it.
