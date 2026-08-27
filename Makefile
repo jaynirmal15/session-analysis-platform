@@ -78,9 +78,22 @@ test-integration:
 	SAP_TEST_DATABASE_URL="postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable" \
 		go test -tags integration -count=1 ./...
 
-## check: everything CI runs — fmt-check, vet, build, test
+## tidy-check: fail if go.mod/go.sum are not what `go mod tidy` produces
+.PHONY: tidy-check
+tidy-check:
+	@# CI enforces this, so `make check` must too — otherwise a green local
+	@# check and a red CI run disagree, which is how trust in `make check` dies.
+	@cp go.mod go.mod.bak && cp go.sum go.sum.bak
+	@go mod tidy
+	@if ! diff -q go.mod go.mod.bak >/dev/null || ! diff -q go.sum go.sum.bak >/dev/null; then \
+		mv go.mod.bak go.mod; mv go.sum.bak go.sum; \
+		echo "go.mod/go.sum are not tidy; run 'go mod tidy'" >&2; exit 1; \
+	fi
+	@rm -f go.mod.bak go.sum.bak
+
+## check: everything CI runs — fmt-check, tidy-check, vet, build, test
 .PHONY: check
-check: fmt-check vet build test
+check: fmt-check tidy-check vet build test
 
 # --- Migrations -------------------------------------------------------------
 #
