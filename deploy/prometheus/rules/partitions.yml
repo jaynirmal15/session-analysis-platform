@@ -1,0 +1,68 @@
+groups:
+  - name: partition-maintenance
+    interval: 30s
+    rules:
+      # The job runs daily and maintains 14 days ahead, so healthy runway
+      # oscillates between 13 and 14. Seven days means roughly seven
+      # consecutive failed runs: the self-healing has failed, not hiccupped.
+      #
+      # Deliberately NOT alerting at 13 (one missed run). A single miss recovers
+      # on the next tick, and an alert that fires on recoverable hiccups trains
+      # people to ignore it — at which point it stops working for the case that
+      # matters. The alert fires when recovery has stopped happening.
+      - alert: PartitionRunwayLow
+        expr: sap_partition_runway_days < 7
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "event_raw has {{ $value | printf \"%.1f\" }} days of partition runway"
+          description: >-
+            Partition maintenance has not extended the schema for about a week.
+            There is no DEFAULT partition, so when runway reaches zero inserts
+            fail outright. Recover by running
+            `SELECT maintain_event_raw_partitions();` — it is idempotent — then
+            find out why pg_cron stopped.
+
+      # Three days from hard insert failures, i.e. three more missed runs.
+      - alert: PartitionRunwayCritical
+        expr: sap_partition_runway_days < 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "event_raw runs out of partitions in {{ $value | printf \"%.1f\" }} days"
+          description: >-
+            Imminent data loss. Every event whose occurred_at falls past the
+            last boundary will be rejected and counted by
+            sap_ingest_partition_missing_total, not stored. Run
+            `SELECT maintain_event_raw_partitions();` now.
+
+      # The runway metric itself going missing is indistinguishable from a
+      # healthy schema if nothing watches for its absence. This is the guard on
+      # the guard.
+      - alert: PartitionRunwayMetricMissing
+        expr: absent(sap_partition_runway_days)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The partition runway metric has stopped reporting"
+          description: >-
+            sql-exporter is not producing sap_partition_runway_days. The schema
+            may be fine, but nothing is watching it — which is the state that
+            let the original bootstrap window go unnoticed.
+
+      # Retention not running is quieter than runway exhaustion but is still a
+      # failure: partitions accumulate, planning cost grows, storage grows.
+      # 70 days = 56 retention + 14 forward, plus a day of slack.
+      - alert: PartitionRetentionStalled
+        expr: sap_partition_oldest_days > 70
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oldest event_raw partition is {{ $value | printf \"%.0f\" }} days old"
+          description: >-
+            Retention is not dropping aged-out partitions. Expected ceiling is
+            the retention window (56d) plus the forward window (14d).
