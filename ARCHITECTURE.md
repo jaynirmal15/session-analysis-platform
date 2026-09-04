@@ -51,6 +51,7 @@ Two conventions worth stating up front:
 | [ADR-0026](#adr-0026--verify-webhook-signatures-with-golang-jwt-not-the-livekit-sdk) | Verify signatures with golang-jwt, not the LiveKit SDK | Accepted |
 | [ADR-0027](#adr-0027--response-codes-are-a-control-channel-not-a-status-report) | Response codes are a control channel | Accepted |
 | [ADR-0028](#adr-0028--verification-artifacts-must-themselves-be-verified) | Verification artifacts must themselves be verified | Accepted |
+| [ADR-0029](#adr-0029--partition-maintenance-runs-inside-the-database-on-pg_cron) | Partition maintenance runs inside the database, on `pg_cron` | Accepted |
 
 ---
 
@@ -2494,6 +2495,165 @@ happening rather than a session later. See ADR-0027.
   them, and the entry needs a more general detector rather than a longer list.
 
 ---
+## ADR-0029 — Partition maintenance runs inside the database, on pg_cron
+
+**Status:** Accepted · 2026-09-04
+
+### Context
+
+ADR-0024 partitions `event_raw` by day and deliberately provides no `DEFAULT`
+partition, on the grounds that a default converts a loud outage into quiet
+wrongness. ADR-0023 then kept partition creation out of the migration tool on
+the grounds that recurring maintenance written as a migration only *looks*
+handled. Both decisions were correct and both deferred the same obligation:
+migration `000002` creates a finite bootstrap window — seven days back, fourteen
+forward, computed when it runs — and nothing extended it.
+
+That obligation had a date on it. When the window ran out, every insert whose
+`occurred_at` fell past the last boundary would fail outright.
+
+This entry records the mechanism, where it runs, and how its absence is
+detected.
+
+### Decision
+
+**The mechanism is a function in the database; the schedule is a `pg_cron` entry
+in the same database.**
+
+Migration `000004` adds `maintain_event_raw_partitions(ahead_days DEFAULT 14,
+retain_days DEFAULT 56)`, which extends the window forward and drops what has
+aged out, and `event_raw_partition`, a view that parses partition bounds out of
+`pg_get_expr`. The function is idempotent, starts from today rather than from
+the furthest existing boundary so a gap left by a failed run is filled rather
+than skipped, and refuses `retain_days < ahead_days` so retention cannot reach
+into live partitions.
+
+Migration `000005` schedules it at `17 2 * * *`. The two are separate migrations
+because `000005` has a hard dependency `000004` does not: `pg_cron` must be
+listed in `shared_preload_libraries`. The mechanism must apply to any PostgreSQL
+so that tests and manual recovery work anywhere; only the schedule needs the
+extension.
+
+Because `shared_preload_libraries` is a server setting rather than something an
+extension can be added to at runtime, PostgreSQL is now **built** from
+`deploy/postgres/Dockerfile` rather than pulled.
+
+**Absence is detected by observing the schema, not the job.** `sql_exporter`
+publishes runway days, oldest-partition age, partition count, and `pg_cron` run
+counts by status; the Prometheus rules alert on runway. A job that succeeds
+nightly and creates nothing still exhausts the runway, so run counts are kept as
+a separate metric rather than folded into the health signal. The warning fires
+at seven days of remaining runway rather than at one missed run, because an
+alert that fires on recoverable hiccups is one people learn to ignore.
+
+`scripts/partition-alert-check.sh` drops real future partitions, waits for a
+real scrape and a real rule evaluation, and restores the window on exit — per
+ADR-0028, the guard is itself verified against reality rather than asserted.
+
+### Alternatives considered
+
+**A Kubernetes CronJob, or any external scheduler** — the obvious placement
+given ADR-0012, and it keeps the database free of extensions.
+
+*Rejected because* the schedule would then stop running the moment the database
+is started without that other thing — which is every local `docker compose up`,
+and every benchmark run the ceiling measurement in ADR-0004 depends on. A
+partitioned schema that only stays alive in one deployment environment is a
+schema that fails in all the others, quietly, until an insert errors. Partition
+existence is a property of the database, so the thing that maintains it should
+have the same lifetime as the database.
+
+**A loop in the ingester** — no new infrastructure, no extension, and the
+ingester already holds a connection pool.
+
+*Rejected because* it makes partition existence depend on application liveness
+and on which replica wins a race. Partitions must exist even when nothing is
+ingesting — most obviously during a benchmark seed, which writes directly. It
+also puts a schema-management privilege in the process most exposed to
+untrusted input, which ADR-0026's posture on the webhook path argues against.
+
+**A `DEFAULT` partition to absorb overflow, with no scheduled job at all** —
+removes the failure mode entirely and needs no extension.
+
+*Rejected, and this is a re-affirmation rather than a new decision.* ADR-0024
+already rejected it: a default silently absorbs misrouted rows and every later
+`ATTACH` must scan it. What this entry adds is that the no-`DEFAULT` choice is
+only survivable if something extends the window *and* something notices when it
+stops — which is why the alert rules, not just the job, are part of this
+decision.
+
+**Partition maintenance as a migration** — considered and rejected in ADR-0023.
+Recorded here only so the boundary is not re-litigated: migrations run once per
+deploy, this must run every day forever.
+
+**`pg_partman`** — the established extension for exactly this problem, with
+retention, pre-creation and background workers already built.
+
+*Rejected — but the repository contains no evidence this was weighed at the
+time, and the reasoning below is reconstructed.* The arguments that hold: it is
+a second extension with more surface than the roughly ninety lines it would
+replace, its behaviour under partition exhaustion is one more thing to learn
+before it can be trusted, and a hand-written function is legible to a reader of
+this repository in a way a configured extension is not. Against that, it is
+better tested than anything written here and it solves failure modes not yet
+encountered. **This is the weakest rejection in this entry and the first place
+to look if the hand-rolled function grows.**
+
+### Consequences
+
+- **PostgreSQL is now a built image.** Anyone running this stack builds it;
+  `docker compose up` is no longer a pure pull.
+- **This narrows managed-PostgreSQL portability, which ADR-0004 explicitly
+  tried to preserve.** ADR-0004 rejected TimescaleDB partly because "depending
+  on an extension narrows which managed PostgreSQL offerings the project can run
+  on later," and this entry takes on exactly that kind of dependency. The
+  difference is one of degree rather than of kind: `pg_cron` is offered by the
+  major managed providers and is removable without touching the schema, since
+  `000004` stands alone and the function can be driven by anything. It is still
+  a real erosion of ADR-0004's stated position and should be read as one.
+- **CI cannot apply migration `000005`.** The integration job runs a stock
+  `postgres:16-alpine` service container, which cannot set
+  `shared_preload_libraries`, and GitHub Actions service containers cannot be
+  built from a Dockerfile. The observed failure is
+  `pq: extension "pg_cron" is not available`, which also leaves the migration
+  version dirty. **Unresolved at the time of writing** — it needs either a
+  `docker run` step instead of a service container, a published image, or a
+  decision to gate `000005`. It is recorded rather than worked around because a
+  green CI that skips the migration would be the ADR-0028 failure again.
+- **Retention drops data; nothing archives it.** `DROP TABLE` on the partition
+  is the whole retirement path.
+- **The function is specific to `event_raw`.** A second partitioned table needs
+  either a second function or a generalisation.
+
+### What is not recorded
+
+Reconstructed entries should be honest about their gaps. The following are in
+the code without a recorded reason, and this entry does not invent one:
+
+- **`retain_days = 56`.** It is consistent with the eight-week window ADR-0024
+  used when sizing daily partitions, so it is not arbitrary — but retention
+  remains an open product question in this document, and nothing states that
+  eight weeks was chosen here rather than inherited.
+- **`ahead_days = 14`.** Matches the forward half of `000002`'s bootstrap
+  window. Whether that number was ever justified, as opposed to copied, is not
+  recorded anywhere.
+- **The pinned `sql_exporter` version.** No note explains the choice of
+  `0.17.3` over any other release.
+- **Dropping without archiving.** The code treats it as settled; no entry weighs
+  it against exporting aged partitions first.
+
+### Revisit when
+
+- Deployment moves to a managed PostgreSQL where `pg_cron` is unavailable or
+  restricted. `000004` is independent of it; only `000005` would need replacing.
+- Retention is actually decided as a product question, at which point
+  `retain_days` should stop being a default nobody chose.
+- A second table needs partitioning, which is when the function's hardcoded
+  reference to `event_raw` has to be generalised.
+- The hand-written function acquires a third responsibility, which is the point
+  at which `pg_partman` starts being cheaper than maintaining this.
+
+---
 ## Open questions
 
 Not yet decisions. Listed so they are not mistaken for oversights.
@@ -2502,13 +2662,9 @@ Entries leave this list when they become decisions. Session-end semantics became
 ADR-0020, the settling window ADR-0021, canonical identity ADR-0017,
 multi-tenancy ADR-0018, the correlation trigger ADR-0025, and telling an
 integration break from ordinary bad requests was closed by the `verified` label
-described in ADR-0027.
+described in ADR-0027. The partition maintenance mechanism was closed by
+ADR-0029.
 
-- **Partition maintenance mechanism.** Partitions must be created ahead of time
-  or inserts fail (ADR-0024), and ADR-0023 deliberately keeps this out of the
-  migration tool. Whether it is `pg_cron`, a Kubernetes CronJob, or a loop in
-  the ingester is undecided. The bootstrap window is finite and nothing extends
-  it, so this is an obligation with a date on it rather than a future concern.
 - **The default reconnect gap.** ADR-0019 makes the threshold a query parameter
   with a configured default. The default's value is still a guess nobody has
   justified, and the platform can now collect the data to justify it.
