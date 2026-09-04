@@ -1,0 +1,75 @@
+# Runway metrics for event_raw's partitioning.
+#
+# These observe the actual state of the schema, not whether a job ran. That
+# distinction is the whole point (ADR-0028): a maintenance job that runs
+# successfully every night and creates nothing still exhausts the runway, and
+# only a metric that looks at the partitions themselves catches it.
+global:
+  scrape_timeout: 10s
+  scrape_timeout_offset: 500ms
+  min_interval: 30s
+  max_connections: 3
+  max_idle_connections: 3
+
+target:
+  data_source_name: "postgres://sap:sap@postgres:5432/sap?sslmode=disable"
+  collectors: [partitions]
+
+collectors:
+  - collector_name: partitions
+
+    metrics:
+      # How far ahead the schema is provisioned. THE metric: when this reaches
+      # zero, inserts start failing, because there is no DEFAULT partition to
+      # absorb them (ADR-0024, deliberately).
+      #
+      # Reported in days rather than seconds, against Prometheus convention.
+      # Partitions are daily, so days is the resolution of the underlying
+      # thing — half a day of runway is not meaningfully different from none,
+      # since you cannot have half a partition.
+      - metric_name: sap_partition_runway_days
+        type: gauge
+        help: "Days between now and the furthest event_raw partition boundary. Zero means inserts are about to fail."
+        values: [runway_days]
+        query: |
+          SELECT COALESCE(
+                   EXTRACT(EPOCH FROM (max(range_end) - now())) / 86400.0,
+                   0
+                 ) AS runway_days
+            FROM event_raw_partition;
+
+      # How far back the schema still reaches. Catches retention silently not
+      # running, which is the quieter half of the same failure.
+      - metric_name: sap_partition_oldest_days
+        type: gauge
+        help: "Age in days of the oldest event_raw partition's start boundary."
+        values: [oldest_days]
+        query: |
+          SELECT COALESCE(
+                   EXTRACT(EPOCH FROM (now() - min(range_start))) / 86400.0,
+                   0
+                 ) AS oldest_days
+            FROM event_raw_partition;
+
+      - metric_name: sap_partition_count
+        type: gauge
+        help: "Number of event_raw partitions. Sanity check against runway and oldest."
+        values: [n]
+        query: |
+          SELECT count(*)::float AS n FROM event_raw_partition;
+
+      # Whether the mechanism ran, which is a different question from whether
+      # the schema is healthy. Kept separate on purpose: a green run count with
+      # a falling runway is a real and confusing state, and collapsing the two
+      # metrics would hide it.
+      - metric_name: sap_partition_maintenance_runs_total
+        type: gauge
+        help: "pg_cron runs of the partition maintenance job, by status. A gauge, not a counter: it is a snapshot of pg_cron's own history table, which is pruned."
+        key_labels: [status]
+        values: [runs]
+        query: |
+          SELECT d.status AS status, count(*)::float AS runs
+            FROM cron.job_run_details d
+            JOIN cron.job j ON j.jobid = d.jobid
+           WHERE j.jobname = 'maintain-event-raw-partitions'
+           GROUP BY d.status;

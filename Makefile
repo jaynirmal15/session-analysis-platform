@@ -202,6 +202,26 @@ run-local-api: infra-up
 	SAP_ENVIRONMENT=local-host \
 	go run -ldflags "$(LDFLAGS)" ./cmd/queryapi
 
+## partitions: show the current partition window and runway
+.PHONY: partitions
+partitions:
+	@docker compose exec -T postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) -c \
+	  "SELECT count(*) AS partitions, \
+	          round(EXTRACT(EPOCH FROM (max(range_end)-now()))/86400.0, 1) AS runway_days, \
+	          round(EXTRACT(EPOCH FROM (now()-min(range_start)))/86400.0, 1) AS oldest_days \
+	     FROM event_raw_partition;"
+
+## maintain: run partition maintenance by hand (idempotent)
+.PHONY: maintain
+maintain:
+	@docker compose exec -T postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) -c \
+	  "SELECT * FROM maintain_event_raw_partitions();"
+
+## alert-check: break the runway on purpose and prove the alert fires
+.PHONY: alert-check
+alert-check:
+	./scripts/partition-alert-check.sh
+
 ## smoke: drive real LiveKit and assert the rows its webhooks produce
 .PHONY: smoke
 smoke:

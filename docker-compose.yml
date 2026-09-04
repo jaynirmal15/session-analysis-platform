@@ -11,8 +11,17 @@ name: session-analysis-platform
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # Built rather than pulled: pg_cron must be in shared_preload_libraries,
+    # which is a server setting. See deploy/postgres/Dockerfile and ADR-0029.
+    build:
+      context: deploy/postgres
     restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_cron
+      - -c
+      - cron.database_name=${POSTGRES_DB:-sap}
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sap}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sap}
@@ -81,11 +90,33 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
     depends_on:
       - otel-collector
+
+  # Turns the partition-runway queries into metrics. A dedicated SQL exporter
+  # rather than postgres_exporter's custom-query support, which is deprecated —
+  # the runway metric is the guard on a schema that hard-fails when it lapses,
+  # and building a guard on a deprecated flag is how guards disappear quietly
+  # (ADR-0028, ADR-0029). Not exposed by the ingester either: runway is a
+  # property of the database, and "the ingester is down" must not be the same
+  # event as "we can no longer see the schema's runway".
+  sql-exporter:
+    image: burningalchemist/sql_exporter:0.17.3
+    restart: unless-stopped
+    command: ["-config.file=/etc/sql_exporter/config.yml"]
+    volumes:
+      - ./deploy/sql_exporter:/etc/sql_exporter:ro
+    environment:
+      SQL_EXPORTER_DSN: postgres://${POSTGRES_USER:-sap}:${POSTGRES_PASSWORD:-sap}@postgres:5432/${POSTGRES_DB:-sap}?sslmode=disable
+    ports:
+      - "9399:9399"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
   grafana:
     image: grafana/grafana:12.1.0
