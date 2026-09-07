@@ -1,9 +1,9 @@
 // Package maintenance holds the tests for partition maintenance.
 //
 // There is no Go code here and there should not be. The maintenance mechanism
-// is a PL/pgSQL function shipped in migration 000004 and scheduled by pg_cron
-// in 000005, because partition creation is a property of the database rather
-// than of any application (ADR-0029). Putting a Go implementation beside it
+// is a PL/pgSQL function shipped in migration 000004 and started on a schedule
+// by scripts/schedule-partition-maintenance.sql, because partition creation is
+// a property of the database rather than of any application (ADR-0029). Putting a Go implementation beside it
 // would create a second mechanism that could disagree with the first.
 //
 // What lives here is the verification. ADR-0028 requires that an artifact

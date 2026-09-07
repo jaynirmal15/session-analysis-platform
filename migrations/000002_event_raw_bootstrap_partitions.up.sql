@@ -12,9 +12,13 @@
 -- migration -- see ADR-0023 on why conflating maintenance with schema change
 -- is the mistake this tool choice is meant to prevent.
 --
--- TODO(scope): the recurring partition maintenance job. Until it exists, this
--- window is finite and inserts past its end WILL fail. That is intended: there
--- is no DEFAULT partition, because a default partition silently absorbs
+-- This window is finite. Extending it is the job of
+-- maintain_event_raw_partitions (migration 000004), scheduled by
+-- scripts/schedule-partition-maintenance.sql and watched by the runway alert
+-- (ADR-0029).
+--
+-- If that job stops, inserts past this window's end WILL fail. That is
+-- intended: there is no DEFAULT partition, because a default silently absorbs
 -- misrouted rows and forces a full scan of itself on every later ATTACH.
 -- Failing loudly is the same call ADR-0016 makes about unstable identity.
 

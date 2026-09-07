@@ -2517,8 +2517,8 @@ detected.
 
 ### Decision
 
-**The mechanism is a function in the database; the schedule is a `pg_cron` entry
-in the same database.**
+**The mechanism is schema and is a migration. The schedule is deployment
+configuration and is not.**
 
 Migration `000004` adds `maintain_event_raw_partitions(ahead_days DEFAULT 14,
 retain_days DEFAULT 56)`, which extends the window forward and drops what has
@@ -2528,15 +2528,32 @@ the furthest existing boundary so a gap left by a failed run is filled rather
 than skipped, and refuses `retain_days < ahead_days` so retention cannot reach
 into live partitions.
 
-Migration `000005` schedules it at `17 2 * * *`. The two are separate migrations
-because `000005` has a hard dependency `000004` does not: `pg_cron` must be
-listed in `shared_preload_libraries`. The mechanism must apply to any PostgreSQL
-so that tests and manual recovery work anywhere; only the schedule needs the
-extension.
+`scripts/schedule-partition-maintenance.sql` starts it running at `17 2 * * *`,
+applied by `make schedule-maintenance` and by a one-shot compose service that
+runs once migrations complete. It is idempotent: `cron.schedule()` keyed on a
+job name is an upsert, so re-running re-asserts the schedule rather than
+duplicating it.
+
+**This was migration `000005` first, and the reason it is not one is worth
+recording.** `pg_cron` permits `CREATE EXTENSION` only in the database named by
+the server's `cron.database_name` setting. Applying the migration anywhere else
+fails with `can only create extension in database sap` and leaves the version
+table dirty. That is not a CI inconvenience — it means the migration set could
+never be applied to CI, to a scratch database, to a per-branch database, or to
+any environment whose database is named differently. A migration that only
+works in one database is not a migration.
+
+The split that survives is a clean one. Migration `000004` creates the view and
+the function, depends on nothing but PostgreSQL, and round-trips up and down on
+any database. The schedule needs a specific server build and a specific database
+name, which are properties of a deployment. Keeping them apart is what lets the
+schema be tested everywhere while the schedule is installed only where it can
+actually run.
 
 Because `shared_preload_libraries` is a server setting rather than something an
-extension can be added to at runtime, PostgreSQL is now **built** from
-`deploy/postgres/Dockerfile` rather than pulled.
+extension can be added to at runtime, PostgreSQL is still **built** from
+`deploy/postgres/Dockerfile` rather than pulled — but only the running
+deployment needs that image now, not the migration set.
 
 **Absence is detected by observing the schema, not the job.** `sql_exporter`
 publishes runway days, oldest-partition age, partition count, and `pg_cron` run
@@ -2603,23 +2620,26 @@ to look if the hand-rolled function grows.**
 
 - **PostgreSQL is now a built image.** Anyone running this stack builds it;
   `docker compose up` is no longer a pure pull.
-- **This narrows managed-PostgreSQL portability, which ADR-0004 explicitly
-  tried to preserve.** ADR-0004 rejected TimescaleDB partly because "depending
-  on an extension narrows which managed PostgreSQL offerings the project can run
-  on later," and this entry takes on exactly that kind of dependency. The
-  difference is one of degree rather than of kind: `pg_cron` is offered by the
-  major managed providers and is removable without touching the schema, since
-  `000004` stands alone and the function can be driven by anything. It is still
-  a real erosion of ADR-0004's stated position and should be read as one.
-- **CI cannot apply migration `000005`.** The integration job runs a stock
-  `postgres:16-alpine` service container, which cannot set
-  `shared_preload_libraries`, and GitHub Actions service containers cannot be
-  built from a Dockerfile. The observed failure is
-  `pq: extension "pg_cron" is not available`, which also leaves the migration
-  version dirty. **Unresolved at the time of writing** — it needs either a
-  `docker run` step instead of a service container, a published image, or a
-  decision to gate `000005`. It is recorded rather than worked around because a
-  green CI that skips the migration would be the ADR-0028 failure again.
+- **The schema does not depend on an extension; the deployment does.** ADR-0004
+  rejected TimescaleDB partly because "depending on an extension narrows which
+  managed PostgreSQL offerings the project can run on later." Once the schedule
+  left the migration set, that objection stops applying to the schema: the
+  migrations apply to any stock PostgreSQL 16, and `event_raw` and
+  `maintain_event_raw_partitions` know nothing about `pg_cron`. What remains is
+  a deployment that wants a server with `pg_cron` available, and a schedule that
+  can be replaced by any external caller of the same function without touching
+  the schema. That is a much narrower commitment than ADR-0004 was guarding
+  against, but it is not zero, and it is the reason the split was worth making
+  rather than papering over the CI failure.
+- **`pg_cron` wiring is verified locally, not in CI.** The extension, the
+  schedule, the exporter and the alert rules are exercised end-to-end by
+  `scripts/partition-alert-check.sh`, which breaks the runway on a real
+  database and waits for a real rule evaluation. CI covers migrations `000001`
+  through `000004` and the Go tests against stock `postgres:16-alpine`; it does
+  not run the scheduled job. **A CI job for the `pg_cron` path is deferred** —
+  it needs a built image or a `docker run` step rather than a service
+  container. Recorded so the gap is visible: green CI does not currently mean
+  the schedule works.
 - **Retention drops data; nothing archives it.** `DROP TABLE` on the partition
   is the whole retirement path.
 - **The function is specific to `event_raw`.** A second partitioned table needs
@@ -2645,7 +2665,9 @@ the code without a recorded reason, and this entry does not invent one:
 ### Revisit when
 
 - Deployment moves to a managed PostgreSQL where `pg_cron` is unavailable or
-  restricted. `000004` is independent of it; only `000005` would need replacing.
+  restricted. `000004` is independent of it; only
+  `scripts/schedule-partition-maintenance.sql` would need replacing, with any
+  external caller of the same function.
 - Retention is actually decided as a product question, at which point
   `retain_days` should stop being a default nobody chose.
 - A second table needs partitioning, which is when the function's hardcoded
