@@ -300,12 +300,17 @@ against fixtures:
 - **Join maintenance.** `participant_joined` opens, `participant_left` closes,
   `room_finished` closes everything still open in the room with a distinct
   reason. `ended_at` is only ever written from an observed event.
-- The schema: two tables, daily partitioning, three purpose-chosen indexes, all
-  reversible.
+- The schema: two tables, four purpose-chosen indexes, all reversible. Only
+  `event_raw` is partitioned, by day; `participant_join` is deliberately not
+  partitioned, because an overlap search could never prune below "every
+  partition up to the range end" without silently dropping long-running
+  sessions ([ADR-0024](ARCHITECTURE.md#adr-0024--the-event-schema)). Three of
+  the four indexes serve `participant_join`; the fourth is `event_raw`'s
+  participant lookup.
 - OpenTelemetry throughout, including counters for the things the platform
   decided to observe rather than repair — duplicate deliveries, unmatched
   closes, out-of-order closes, missing partitions.
-- The decision log, now twenty-seven entries.
+- The decision log, now twenty-nine entries.
 
 **Deliberately absent** — each has a `TODO(scope)` marker where it will land:
 
@@ -318,11 +323,10 @@ against fixtures:
   shape ([ADR-0003](ARCHITECTURE.md#adr-0003--mediasoup-as-the-deliberate-second-backend)).
 - Any sweeper that closes joins by timeout. There will never be one.
 
-**One live obligation, worth knowing before you run this for real.** Partitions
-must exist ahead of time or inserts fail, there is no `DEFAULT` partition to
-absorb the overflow, and the recurring job that keeps the window ahead of `now()`
-does not exist yet. Migration `000002` creates a finite bootstrap window and
-nothing extends it. See [`migrations/README.md`](migrations/README.md).
+Partitions must exist ahead of `now()` or inserts fail, and the job that keeps
+the window ahead — along with the runway metric and alerts that catch it
+stopping — is described in
+[ADR-0029](ARCHITECTURE.md#adr-0029--partition-maintenance-runs-inside-the-database-on-pg_cron).
 
 ---
 
