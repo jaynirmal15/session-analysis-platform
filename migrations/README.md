@@ -32,11 +32,16 @@ the reasoning inline too — they are meant to be read.
 daily partitions for a fixed window around the time it runs. Partitions must
 exist ahead of time or **inserts fail**, and there is deliberately no `DEFAULT`
 partition to catch the overflow — a default partition trades a loud outage for
-quiet wrongness. The recurring job that keeps the window ahead of `now()` does
-not exist yet.
+quiet wrongness.
 
-TODO(scope): partition maintenance. It is a scheduled job, not a migration, and
-ADR-0023 explains why keeping it out of this directory is deliberate.
+The job that keeps the window ahead of `now()` now exists. Migration `000004`
+adds the function and the view it is observed through; the `pg_cron` schedule
+that drives it lives in `scripts/schedule-partition-maintenance.sql`, not here.
+ADR-0023 explains why the recurring job is not a migration, and
+[ADR-0029](../ARCHITECTURE.md#adr-0029--partition-maintenance-runs-inside-the-database-on-pg_cron)
+explains why even the schedule that starts it is not one either: `pg_cron`
+allows `CREATE EXTENSION` only in the database named by `cron.database_name`,
+so as a migration it could never apply to CI or to a scratch database.
 
 **A failed migration leaves a dirty version.** golang-migrate marks the version
 table dirty and refuses to proceed until it is cleared:

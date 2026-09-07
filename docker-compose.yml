@@ -53,6 +53,28 @@ services:
       postgres:
         condition: service_healthy
 
+  # Starts the maintenance job running, once migrations have applied. Separate
+  # from `migrate` because pg_cron's CREATE EXTENSION only works in the database
+  # named by cron.database_name, which makes the schedule undeployable as a
+  # migration anywhere but here (ADR-0029). Stock postgres image: this is a psql
+  # client, and only the server needs the extension. Idempotent, so re-running
+  # `docker compose up` re-asserts the schedule rather than duplicating it.
+  schedule-maintenance:
+    image: postgres:16-alpine
+    restart: "no"
+    command:
+      - psql
+      - postgres://${POSTGRES_USER:-sap}:${POSTGRES_PASSWORD:-sap}@postgres:5432/${POSTGRES_DB:-sap}?sslmode=disable
+      - -v
+      - ON_ERROR_STOP=1
+      - -f
+      - /scripts/schedule-partition-maintenance.sql
+    volumes:
+      - ./scripts:/scripts:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
   livekit:
     image: livekit/livekit-server:v1.9
     restart: unless-stopped
@@ -115,7 +137,7 @@ services:
     ports:
       - "9399:9399"
     depends_on:
-      migrate:
+      schedule-maintenance:
         condition: service_completed_successfully
 
   grafana:

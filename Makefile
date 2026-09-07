@@ -202,6 +202,12 @@ run-local-api: infra-up
 	SAP_ENVIRONMENT=local-host \
 	go run -ldflags "$(LDFLAGS)" ./cmd/queryapi
 
+## schedule-maintenance: (re)install the pg_cron schedule -- idempotent
+.PHONY: schedule-maintenance
+schedule-maintenance:
+	@docker compose exec -T postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) \
+	  -v ON_ERROR_STOP=1 -f - < scripts/schedule-partition-maintenance.sql
+
 ## partitions: show the current partition window and runway
 .PHONY: partitions
 partitions:

@@ -1,9 +1,12 @@
 -- Partition maintenance: the obligation ADR-0024 created and ADR-0023
 -- deliberately refused to solve as a migration.
 --
--- This file provides the *mechanism*. Scheduling it is migration 000005, and
--- the two are separate on purpose: the function must exist on every database,
--- including ones with no pg_cron, so that tests and manual runs work anywhere.
+-- This file provides the *mechanism*. Starting it on a schedule is
+-- scripts/schedule-partition-maintenance.sql, and the two are separate on
+-- purpose: the function must exist on every database, including ones with no
+-- pg_cron, so that tests and manual runs work anywhere. pg_cron itself can only
+-- be installed in one database per server, which is why the schedule is not a
+-- migration at all (ADR-0029).
 
 -- Partition bounds are not exposed as structured catalog columns. pg_get_expr
 -- returns them as text — "FOR VALUES FROM ('...') TO ('...')" — and parsing
