@@ -40,6 +40,29 @@ func runwayDays(t *testing.T, p *pgxpool.Pool) float64 {
 	return days
 }
 
+// boundaryDays returns how many whole days past today the furthest partition
+// boundary reaches, measured the same way the function measures it -- UTC dates,
+// not an instant.
+//
+// This, not runwayDays, is what maintain_event_raw_partitions actually
+// guarantees. Runway is a fractional quantity that shrinks continuously between
+// any two reads, so an assertion comparing one read against a target derived
+// from an earlier read fails by however long the test took. The boundary is a
+// midnight date and does not move.
+func boundaryDays(t *testing.T, p *pgxpool.Pool) int {
+	t.Helper()
+	var days int
+	err := p.QueryRow(context.Background(), `
+		SELECT COALESCE(
+		         (max(range_end) AT TIME ZONE 'UTC')::date
+		           - (now() AT TIME ZONE 'UTC')::date, 0)
+		  FROM event_raw_partition`).Scan(&days)
+	if err != nil {
+		t.Fatalf("boundary: %v", err)
+	}
+	return days
+}
+
 func partitionCount(t *testing.T, p *pgxpool.Pool) int {
 	t.Helper()
 	var n int
@@ -104,15 +127,20 @@ func TestMaintenanceExtendsRunway(t *testing.T) {
 	before := runwayDays(t, p)
 
 	// Ask for more runway than currently exists.
-	want := before + 10
-	maintain(t, p, int(want)+1, 400)
+	ahead := int(before) + 11
+	maintain(t, p, ahead, 400)
 
 	after := runwayDays(t, p)
 	if after <= before {
 		t.Fatalf("runway did not grow: before=%.1f after=%.1f", before, after)
 	}
-	if after < want {
-		t.Errorf("runway = %.1f days, want at least %.1f", after, want)
+
+	// The guarantee is about the boundary, not about the runway at the instant
+	// of reading. Partitions are created for [today, today+ahead), so the
+	// furthest upper bound must be exactly today+ahead days out.
+	if got := boundaryDays(t, p); got < ahead {
+		t.Errorf("furthest partition boundary is %d days past today, want at least %d",
+			got, ahead)
 	}
 }
 
